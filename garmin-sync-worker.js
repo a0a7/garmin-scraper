@@ -12,6 +12,9 @@ const PAGE_SIZE = 20;
 const ACTIVITIES_TABLE = 'activities';
 const EXERCISE_SETS_TABLE = 'exercise_sets';
 
+// Activity types that typically have outdoor GPS/weather data
+const OUTDOOR_ACTIVITIES = ['running', 'cycling', 'walking', 'hiking', 'mountain_biking', 'road_biking', 'trail_running'];
+
 // ES Module exports for scheduled and fetch events
 export default {
   async scheduled(event, env, ctx) {
@@ -135,13 +138,36 @@ async function handleRequest(request, env, ctx) {
     return handleUpdateAllActivities(request, env);
   }
 
+  // Stats endpoint with cached statistics
+  if (url.pathname === '/stats' && request.method === 'GET') {
+    return handleGetActivityStats(request, env);
+  }
+
+  // Set sync time to latest activity endpoint
+  if (url.pathname === '/set-sync-time' && request.method === 'POST') {
+    const syncTime = await setLastSyncTimeToLatestActivity(env);
+    return new Response(JSON.stringify({
+      success: !!syncTime,
+      lastSyncTime: syncTime,
+      message: syncTime ? `Sync time set to ${syncTime}` : 'No activities found to set sync time'
+    }), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+
   if (url.pathname === '/status') {
     const lastSync = await getLastSyncTime(env);
     return new Response(JSON.stringify({
       lastSync: lastSync || 'Never',
       timestamp: new Date().toISOString()
     }), {
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
     });
   }
   
@@ -448,28 +474,129 @@ async function syncGarminData(env) {
     
     console.log(`Last sync: ${lastSyncTime || 'Never'}, Initial sync: ${isInitialSync}`);
 
-    // Fetch activities since last sync
-    const activities = await fetchActivities(authData, lastSyncTime, isInitialSync);
-    console.log(`Fetched ${activities.length} activities`);
+    if (isInitialSync) {
+      // For initial sync, use batch processing to avoid subrequest limits
+      return await handleInitialSync(authData, env);
+    } else {
+      // For regular syncs, use existing logic with smaller limits
+      const activities = await fetchActivities(authData, lastSyncTime, isInitialSync);
+      console.log(`Fetched ${activities.length} activities`);
 
-    // Process and store activities
-    const processedCount = await processAndStoreActivities(activities, authData, env);
-    
-    // Update last sync time
-    await updateLastSyncTime(env);
+      // Process and store activities with subrequest limit awareness
+      const processedCount = await processAndStoreActivitiesWithLimits(activities, authData, env);
+      
+      // Update last sync time
+      await updateLastSyncTime(env);
 
-    return {
-      success: true,
-      activitiesProcessed: processedCount,
-      isInitialSync,
-      timestamp: new Date().toISOString()
-    };
+      // Refresh activity statistics cache
+      await refreshActivityStats(env);
+
+      return {
+        success: true,
+        activitiesProcessed: processedCount,
+        isInitialSync,
+        timestamp: new Date().toISOString()
+      };
+    }
     
   } catch (error) {
     console.error('Sync error:', error);
     return {
       success: false,
       error: error.message,
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+/**
+ * Handle initial sync with batch processing to avoid subrequest limits
+ */
+async function handleInitialSync(authData, env) {
+  try {
+    console.log('🚀 Starting initial sync with batch processing...');
+    
+    // Get sync progress from KV to resume if needed
+    const progressKey = 'initial_sync_progress';
+    let progress = await env.GARMIN_KV.get(progressKey, 'json') || {
+      totalProcessed: 0,
+      currentBatch: 0,
+      completed: false,
+      startTime: new Date().toISOString()
+    };
+
+    if (progress.completed) {
+      console.log('✅ Initial sync already completed');
+      // Clear progress and update last sync time
+      await env.GARMIN_KV.delete(progressKey);
+      await updateLastSyncTime(env);
+      await refreshActivityStats(env);
+      
+      return {
+        success: true,
+        activitiesProcessed: progress.totalProcessed,
+        isInitialSync: true,
+        message: 'Initial sync completed in previous execution',
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    const BATCH_SIZE = 50; // Process 50 activities per batch
+    const MAX_SUBREQUESTS_PER_BATCH = 200; // Conservative limit (each activity can make 1-4 subrequests)
+    
+    // Fetch a single batch of activities
+    const activities = await fetchActivitiesBatch(authData, progress.currentBatch * BATCH_SIZE, BATCH_SIZE);
+    console.log(`📥 Fetched batch ${progress.currentBatch + 1}: ${activities.length} activities`);
+
+    if (activities.length === 0) {
+      // No more activities to process
+      progress.completed = true;
+      await env.GARMIN_KV.put(progressKey, JSON.stringify(progress));
+      console.log(`✅ Initial sync completed! Total processed: ${progress.totalProcessed}`);
+      
+      // Update last sync time and refresh stats
+      await updateLastSyncTime(env);
+      await refreshActivityStats(env);
+      
+      // Clear progress
+      await env.GARMIN_KV.delete(progressKey);
+      
+      return {
+        success: true,
+        activitiesProcessed: progress.totalProcessed,
+        isInitialSync: true,
+        message: 'Initial sync completed successfully',
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    // Process this batch with subrequest limits
+    const processedCount = await processAndStoreActivitiesWithLimits(activities, authData, env, MAX_SUBREQUESTS_PER_BATCH);
+    
+    // Update progress
+    progress.totalProcessed += processedCount;
+    progress.currentBatch += 1;
+    await env.GARMIN_KV.put(progressKey, JSON.stringify(progress));
+    
+    console.log(`📊 Batch ${progress.currentBatch} complete. Processed: ${processedCount}/${activities.length}, Total: ${progress.totalProcessed}`);
+    
+    return {
+      success: true,
+      activitiesProcessed: processedCount,
+      totalProcessed: progress.totalProcessed,
+      currentBatch: progress.currentBatch,
+      isInitialSync: true,
+      message: `Batch ${progress.currentBatch} completed. Run sync again to continue.`,
+      timestamp: new Date().toISOString()
+    };
+    
+  } catch (error) {
+    console.error('Initial sync error:', error);
+    // Don't clear progress on error so we can resume
+    return {
+      success: false,
+      error: error.message,
+      isInitialSync: true,
       timestamp: new Date().toISOString()
     };
   }
@@ -869,6 +996,28 @@ async function fetchActivities(authData, lastSyncTime, isInitialSync) {
 }
 
 /**
+ * Fetch a single batch of activities for batch processing
+ */
+async function fetchActivitiesBatch(authData, start, limit) {
+  const url = `${GARMIN_BASE_URL}/activitylist-service/activities/search/activities?limit=${limit}&start=${start}`;
+  
+  const headers = {
+    'Accept': 'application/json',
+    'User-Agent': 'com.garmin.android.apps.connectmobile',
+    'Authorization': `Bearer ${authData.bearerToken}`
+  };
+  
+  const response = await fetch(url, { headers });
+  
+  if (!response.ok) {
+    throw new Error(`Failed to fetch activities batch: ${response.statusText}`);
+  }
+  
+  const activities = await response.json();
+  return Array.isArray(activities) ? activities : [];
+}
+
+/**
  * Process and store activities in database
  */
 async function processAndStoreActivities(activities, authData, env) {
@@ -893,8 +1042,7 @@ async function processAndStoreActivities(activities, authData, env) {
       }
       
       // Enrich outdoor activities with weather data
-      const outdoorActivities = ['running', 'cycling', 'walking', 'hiking', 'mountain_biking', 'road_biking', 'trail_running'];
-      if (outdoorActivities.includes(activity.activityType?.typeKey)) {
+      if (OUTDOOR_ACTIVITIES.includes(activity.activityType?.typeKey)) {
         activity.weatherData = await fetchActivityWeatherData(activity.activityId, authData);
       }
       
@@ -913,6 +1061,96 @@ async function processAndStoreActivities(activities, authData, env) {
     }
   }
   
+  return processedCount;
+}
+
+/**
+ * Process and store activities with subrequest limit awareness
+ */
+async function processAndStoreActivitiesWithLimits(activities, authData, env, maxSubrequests = 200) {
+  let processedCount = 0;
+  let subrequestCount = 0;
+  
+  console.log(`🔄 Processing ${activities.length} activities (max ${maxSubrequests} subrequests)...`);
+  
+  for (const activity of activities) {
+    try {
+      // Estimate subrequests needed for this activity
+      let estimatedSubrequests = 0;
+      
+      // Base activity processing (no extra subrequests)
+      estimatedSubrequests += 0;
+      
+      // Exercise sets for strength training
+      if (activity.activityType?.typeKey === 'strength_training') {
+        estimatedSubrequests += 1;
+      }
+      
+      // GPS data for activities with distance
+      if (activity.distance && activity.distance > 0 && 
+          ['running', 'cycling', 'walking', 'hiking', 'mountain_biking'].includes(activity.activityType?.typeKey)) {
+        estimatedSubrequests += 1;
+      }
+      
+      // Weather data for outdoor activities
+      if (OUTDOOR_ACTIVITIES.includes(activity.activityType?.typeKey)) {
+        estimatedSubrequests += 1;
+      }
+      
+      // Check if we would exceed subrequest limit
+      if (subrequestCount + estimatedSubrequests > maxSubrequests) {
+        console.log(`⚠️ Approaching subrequest limit (${subrequestCount}/${maxSubrequests}). Stopping batch processing.`);
+        break;
+      }
+      
+      // Check if activity already exists
+      const existing = await getActivityById(activity.activityId, env);
+      if (existing && !shouldUpdateActivity(existing, activity)) {
+        continue;
+      }
+      
+      console.log(`📝 Processing activity ${activity.activityId} (${activity.activityType?.typeKey || 'unknown'})`);
+      
+      // Enrich strength training activities with exercise sets
+      if (activity.activityType?.typeKey === 'strength_training') {
+        console.log(`💪 Fetching exercise sets for strength training activity ${activity.activityId}`);
+        activity.fullExerciseSets = await fetchActivityExerciseSets(activity.activityId, authData);
+        subrequestCount += 1;
+      }
+      
+      // Enrich GPS activities with route data
+      if (activity.distance && activity.distance > 0 && 
+          ['running', 'cycling', 'walking', 'hiking', 'mountain_biking'].includes(activity.activityType?.typeKey)) {
+        console.log(`🗺️ Fetching GPS data for activity ${activity.activityId}`);
+        activity.gpsData = await fetchActivityRouteData(activity.activityId, authData);
+        subrequestCount += 1;
+      }
+      
+      // Enrich outdoor activities with weather data
+      if (OUTDOOR_ACTIVITIES.includes(activity.activityType?.typeKey)) {
+        console.log(`🌤️ Fetching weather data for activity ${activity.activityId}`);
+        activity.weatherData = await fetchActivityWeatherData(activity.activityId, authData);
+        subrequestCount += 1;
+      }
+      
+      // Process activity data
+      const processedActivity = processActivityData(activity);
+      
+      // Store in database
+      await storeActivity(processedActivity, env);
+      processedCount++;
+      
+      console.log(`✅ Stored activity ${activity.activityId}. Processed: ${processedCount}, Subrequests used: ${subrequestCount}`);
+      
+      // Rate limiting
+      await new Promise(resolve => setTimeout(resolve, 50));
+      
+    } catch (error) {
+      console.error(`❌ Failed to process activity ${activity.activityId}:`, error);
+    }
+  }
+  
+  console.log(`📊 Batch complete: ${processedCount} activities processed, ${subrequestCount} subrequests used`);
   return processedCount;
 }
 
@@ -1184,6 +1422,26 @@ async function getLastSyncTime(env) {
 async function updateLastSyncTime(env) {
   const now = new Date().toISOString();
   await env.GARMIN_SYNC_KV.put('lastSyncTime', now);
+}
+
+// Set sync time to the latest activity's start time
+async function setLastSyncTimeToLatestActivity(env) {
+  try {
+    const query = `SELECT start_time FROM ${ACTIVITIES_TABLE} ORDER BY start_time DESC LIMIT 1`;
+    const result = await env.DATABASE.prepare(query).first();
+    
+    if (result && result.start_time) {
+      await env.GARMIN_SYNC_KV.put('lastSyncTime', result.start_time);
+      console.log(`🕒 Set last sync time to latest activity: ${result.start_time}`);
+      return result.start_time;
+    } else {
+      console.log('⚠️ No activities found in database');
+      return null;
+    }
+  } catch (error) {
+    console.error('❌ Error setting sync time to latest activity:', error);
+    return null;
+  }
 }
 
 async function getActivityById(activityId, env) {
@@ -1763,6 +2021,29 @@ async function handleUpdateAllActivities(request, env) {
 
     console.log(`🎉 Batch completed: ${imported} imported, ${errors} errors. Progress: ${progress}%`);
 
+    // Refresh stats cache and update sync time when the last batch is processed
+    if (isLastBatch) {
+      console.log('📊 Refreshing activity statistics cache...');
+      await refreshActivityStats(env);
+      
+      // Update last sync time to the most recent activity date to prevent unnecessary syncs
+      console.log('🕒 Updating last sync time after bulk upload...');
+      
+      // Find the most recent activity date from all activities
+      let mostRecentDate = null;
+      for (const activity of activities) {
+        const activityDate = new Date(activity.activityData.startTime);
+        if (!mostRecentDate || activityDate > mostRecentDate) {
+          mostRecentDate = activityDate;
+        }
+      }
+      
+      // Set sync time to the most recent activity date, or current time if no activities
+      const syncTime = mostRecentDate ? mostRecentDate.toISOString() : new Date().toISOString();
+      console.log(`Setting lastSyncTime to: ${syncTime}`);
+      await env.GARMIN_SYNC_KV.put('lastSyncTime', syncTime);
+    }
+
     return new Response(JSON.stringify({
       success: true,
       imported: imported,
@@ -1793,6 +2074,202 @@ async function handleUpdateAllActivities(request, env) {
         'Access-Control-Allow-Origin': '*'
       }
     });
+  }
+}
+
+/**
+ * Handle activity statistics endpoint
+ */
+async function handleGetActivityStats(request, env) {
+  try {
+    // Try to get cached stats first
+    let stats = await env.GARMIN_SYNC_KV.get('activity_stats', { type: 'json' });
+    
+    if (!stats) {
+      console.log('📊 No cached stats found, generating fresh statistics...');
+      stats = await generateActivityStats(env);
+      await env.GARMIN_SYNC_KV.put('activity_stats', JSON.stringify(stats));
+    }
+    
+    return new Response(JSON.stringify({
+      success: true,
+      stats: stats,
+      lastUpdated: stats.lastUpdated,
+      cached: true
+    }), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600' // Cache for 1 hour
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error getting activity stats:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), { 
+      status: 500,
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Generate comprehensive activity statistics
+ */
+async function generateActivityStats(env) {
+  console.log('📊 Generating activity statistics...');
+
+  // Main activity statistics query
+  const statsQuery = `
+    SELECT 
+      COUNT(*) as total_count,
+      SUM(COALESCE(duration, 0)) as total_time_seconds,
+      SUM(COALESCE(distance, 0)) as total_distance,
+      SUM(COALESCE(calories, 0)) as total_calories,
+      SUM(COALESCE(elevation_gain, 0)) as total_elevation_gain,
+      SUM(COALESCE(total_reps, 0)) as total_reps,
+      SUM(COALESCE(total_sets, 0)) as total_sets,
+      SUM(COALESCE(total_working_time, 0)) as total_working_time_seconds,
+      MAX(COALESCE(temperature, -999)) as max_temperature,
+      MIN(COALESCE(temperature, 999)) as min_temperature,
+      MAX(COALESCE(wind_speed, 0)) as max_wind_speed,
+      MAX(COALESCE(wind_gust, 0)) as max_wind_gust,
+      COUNT(CASE WHEN has_gps_data = 1 THEN 1 END) as activities_with_gps,
+      COUNT(CASE WHEN has_weather_data = 1 THEN 1 END) as activities_with_weather,
+      COUNT(CASE WHEN type = 'strength_training' THEN 1 END) as strength_training_count,
+      COUNT(CASE WHEN type = 'running' THEN 1 END) as running_count,
+      COUNT(CASE WHEN type = 'cycling' THEN 1 END) as cycling_count
+    FROM activities
+  `;
+
+  const result = await env.DATABASE.prepare(statsQuery).first();
+
+  // Exercise sets count
+  const exerciseSetsQuery = `SELECT COUNT(*) as total_exercise_sets FROM exercise_sets`;
+  const exerciseSetsResult = await env.DATABASE.prepare(exerciseSetsQuery).first();
+
+  // Activity type breakdown
+  const typeBreakdownQuery = `
+    SELECT type, COUNT(*) as count 
+    FROM activities 
+    GROUP BY type 
+    ORDER BY count DESC
+  `;
+  const typeBreakdown = await env.DATABASE.prepare(typeBreakdownQuery).all();
+
+  // Format time helper function
+  const formatDuration = (seconds) => {
+    if (!seconds || seconds === 0) return { formatted: '0 seconds', hours: 0, minutes: 0, seconds: 0 };
+    
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainingSeconds = seconds % 60;
+    
+    let formatted = '';
+    if (hours > 0) formatted += `${hours}h `;
+    if (minutes > 0) formatted += `${minutes}m `;
+    if (remainingSeconds > 0 || formatted === '') formatted += `${remainingSeconds}s`;
+    
+    return {
+      formatted: formatted.trim(),
+      hours,
+      minutes,
+      seconds: remainingSeconds
+    };
+  };
+
+  // Handle edge cases for temperature
+  let hottestTemp = result.max_temperature;
+  let coldestTemp = result.min_temperature;
+  
+  if (hottestTemp === -999) hottestTemp = null;
+  if (coldestTemp === 999) coldestTemp = null;
+
+  const totalTime = formatDuration(result.total_time_seconds);
+  const totalWorkingTime = formatDuration(result.total_working_time_seconds);
+
+  const stats = {
+    lastUpdated: new Date().toISOString(),
+    
+    // Main totals
+    totalCount: result.total_count,
+    totalTime: {
+      seconds: result.total_time_seconds,
+      formatted: totalTime.formatted,
+      breakdown: {
+        hours: totalTime.hours,
+        minutes: totalTime.minutes,
+        seconds: totalTime.seconds
+      }
+    },
+    totalDistance: Math.round(result.total_distance * 100) / 100, // Round to 2 decimal places
+    totalCalories: result.total_calories,
+    totalElevationGain: Math.round(result.total_elevation_gain * 100) / 100,
+    
+    // Strength training
+    totalReps: result.total_reps,
+    totalSets: result.total_sets,
+    totalExerciseSets: exerciseSetsResult.total_exercise_sets,
+    totalWorkingTime: {
+      seconds: result.total_working_time_seconds,
+      formatted: totalWorkingTime.formatted,
+      breakdown: {
+        hours: totalWorkingTime.hours,
+        minutes: totalWorkingTime.minutes,
+        seconds: totalWorkingTime.seconds
+      }
+    },
+    
+    // Weather extremes
+    hottestActivityTemp: hottestTemp,
+    coldestActivityTemp: coldestTemp,
+    highestWindSpeed: result.max_wind_speed,
+    highestWindGust: result.max_wind_gust,
+    
+    // Data coverage
+    activitiesWithGPS: result.activities_with_gps,
+    activitiesWithWeather: result.activities_with_weather,
+    
+    // Activity breakdown
+    activityTypeBreakdown: typeBreakdown.results.map(row => ({
+      type: row.type,
+      count: row.count,
+      percentage: Math.round((row.count / result.total_count) * 100)
+    })),
+    
+    // Popular activity counts
+    strengthTrainingCount: result.strength_training_count,
+    runningCount: result.running_count,
+    cyclingCount: result.cycling_count
+  };
+
+  console.log('📊 Generated statistics:', {
+    totalActivities: stats.totalCount,
+    totalTime: stats.totalTime.formatted,
+    strengthActivities: stats.strengthTrainingCount
+  });
+
+  return stats;
+}
+
+/**
+ * Refresh activity statistics cache
+ */
+async function refreshActivityStats(env) {
+  try {
+    const stats = await generateActivityStats(env);
+    await env.GARMIN_SYNC_KV.put('activity_stats', JSON.stringify(stats));
+    console.log('📊 Activity statistics cache refreshed');
+    return stats;
+  } catch (error) {
+    console.error('❌ Error refreshing activity stats:', error);
+    throw error;
   }
 }
 
