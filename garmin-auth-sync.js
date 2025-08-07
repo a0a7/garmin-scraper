@@ -1,64 +1,5 @@
-/**
- * Garmin Connect Auth Header Extractor + Data Sync
- * This script captures the auth header and then fetches all your data
- * Run this in two steps on connect.garmin.com
- */
 
-// Step 1: Set up auth header capture
-console.log('🔑 Setting up auth header capture...');
-
-let authHeader = null;
-
-// Step 1: Set up auth header capture
-console.log('🔑 Setting up auth header capture...');
-
-// Intercept fetch requests to capture auth header
-const originalFetch = window.fetch;
-window.fetch = function(...args) {
-  const options = args[1] || {};
-  
-  // Capture authorization headers from outgoing requests
-  if (options.headers) {
-    if (options.headers.Authorization && options.headers.Authorization.startsWith('Bearer')) {
-      authHeader = options.headers.Authorization;
-      console.log('✅ Captured auth header from fetch!');
-    }
-    // Also check if headers is a Headers object
-    if (options.headers instanceof Headers) {
-      const auth = options.headers.get('Authorization');
-      if (auth && auth.startsWith('Bearer')) {
-        authHeader = auth;
-        console.log('✅ Captured auth header from Headers object!');
-      }
-    }
-  }
-  
-  return originalFetch.apply(this, args).then(response => {
-    // Try to capture from response headers too (though this is less likely)
-    const auth = response.headers.get('Authorization');
-    if (auth && auth.startsWith('Bearer')) {
-      authHeader = auth;
-      console.log('✅ Captured auth header from response!');
-    }
-    return response;
-  });
-};
-
-// Also try to intercept XMLHttpRequests
-const originalXHRSend = XMLHttpRequest.prototype.send;
-XMLHttpRequest.prototype.send = function(body) {
-  // Check if authorization header is set
-  const authValue = this.getRequestHeader && this.getRequestHeader('Authorization');
-  if (authValue && authValue.startsWith('Bearer')) {
-    authHeader = authValue;
-    console.log('✅ Captured auth header from XHR!');
-  }
-  return originalXHRSend.apply(this, arguments);
-};
-
-console.log('✅ Auth capture set up');
-console.log('💡 Now navigate around Garmin Connect (refresh page, view activities, etc.)');
-console.log('💡 Then run: startDataExtraction()');
+let authHeader = "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImRpLW9hdXRoLXNpZ25lci1wcm9kLTIwMjQtcTEifQ.eyJzY29wZSI6WyJDT01NVU5JVFlfQ09VUlNFX1JFQUQiLCJHT0xGX0FQSV9SRUFEIiwiR0hTX0hJRCIsIkFUUF9SRUFEIiwiRElWRV9BUElfV1JJVEUiLCJHSFNfU0FNRCIsIklOU0lHSFRTX1JFQUQiLCJESVZFX0FQSV9SRUFEIiwiRElWRV9BUElfSU1BR0VfUFJFVklFVyIsIkNPTU1VTklUWV9DT1VSU0VfV1JJVEUiLCJDT05ORUNUX1dSSVRFIiwiRElWRV9TSEFSRURfUkVBRCIsIkdIU19SRUdJU1RSQVRJT04iLCJEVF9DTElFTlRfQU5BTFlUSUNTX1dSSVRFIiwiR09MRl9BUElfV1JJVEUiLCJJTlNJR0hUU19XUklURSIsIlBST0RVQ1RfU0VBUkNIX1JFQUQiLCJHT0xGX1NIQVJFRF9SRUFEIiwiT01UX0NBTVBBSUdOX1JFQUQiLCJPTVRfU1VCU0NSSVBUSU9OX1JFQUQiLCJDT05ORUNUX05PTl9TT0NJQUxfU0hBUkVEX1JFQUQiLCJDT05ORUNUX1JFQUQiLCJBVFBfV1JJVEUiXSwiaXNzIjoiaHR0cHM6Ly9kaWF1dGguZ2FybWluLmNvbSIsInJldm9jYXRpb25fZWxpZ2liaWxpdHkiOlsiR0xPQkFMX1NJR05PVVQiXSwiY2xpZW50X3R5cGUiOiJVTkRFRklORUQiLCJleHAiOjE3NTQ1OTM5MjYsImlhdCI6MTc1NDU5MDMyNiwiZ2FybWluX2d1aWQiOiIxZDVkZDA4ZS1kODMzLTQ0NjktOGEwZS00M2U0YWZlZjhhMTMiLCJqdGkiOiIxMDlmNDZjYy1iMDc5LTRhY2QtOTViNS05ZTEwMWJiNGU3NjAiLCJjbGllbnRfaWQiOiJDT05ORUNUX1dFQiIsImZncCI6ImM0YjAyZjUzYTA5MmU5NDg0ZjVkMGJmNzEwYTgyNDM0NjQxNzZmM2QzZDYxNGFkOGFlNmUyZDU2MThhYzdlN2UifQ.NslgCcP8irBeoJp_Ppg2HGWBWf38C4675gKCEvKEmq6nMVnukx1Nb8SXrnqyMVVJlabJ_0U-nOHdcJ4bD_QpljkjbK_m0I5IvnD6P2-nvTqrymLmJQl6zH8vRNSOmFIO6kzDqfyHtsSOCMgMClWHI4WpvTLjIDxNlMOtcK4jCTfg6Er-oFkLoNCI8ic0kTBtqyfL_EbQ4FfRUhG7RAFqIOmXbkIM0jFTN4gB1YIUwadAtOy-vH4wDEaiFs9_5iAjQzhpnOFfajjvyNvALOygqwLCHd2quJi1KNLu9qcdT7cNBV1Ku76ItvmmBbgaX3XzhqzoqLECH3PIKuFvotkI7A";
 
 // Step 2: Data extraction function
 window.startDataExtraction = async function() {
@@ -445,3 +386,5 @@ window.startDataExtraction = async function() {
 console.log('📝 Setup complete! Instructions:');
 console.log('1. Refresh this page or navigate to view some activities');
 console.log('2. Then run: startDataExtraction()');
+
+window.startDataExtraction();
