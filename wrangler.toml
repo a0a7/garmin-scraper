@@ -1,0 +1,33 @@
+# Cloudflare Workers Configuration for Garmin Sync
+
+name = "garmin-sync-worker"
+main = "garmin-sync-worker.js"
+compatibility_date = "2023-12-01"
+
+# Use ES Module format (required for D1)
+[build]
+command = ""
+
+# Cron trigger - runs daily at 2 AM UTC
+[triggers]
+crons = ["0 2 * * *"]
+
+# Secrets are managed via Cloudflare dashboard or wrangler secret put commands
+# Do not put actual secret values in this file!
+
+# KV namespace for storing sync metadata
+[[kv_namespaces]]
+binding = "GARMIN_SYNC_KV"
+id = "90a6316b89c54af9a2f4d0493869d38f"
+preview_id = "90a6316b89c54af9a2f4d0493869d38f"
+
+# D1 Database for storing activities (optional - use if you want SQL database)
+[[d1_databases]]
+binding = "DATABASE"
+database_name = "garmin-activities"
+database_id = "add4c323-2167-4a1b-a52c-4a530f0c0762"
+
+# Durable Objects (if you need persistent state)
+# [[durable_objects.bindings]]
+# name = "GARMIN_SYNC_STATE"
+# class_name = "GarminSyncState"
