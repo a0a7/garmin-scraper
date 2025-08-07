@@ -130,6 +130,11 @@ async function handleRequest(request, env, ctx) {
     return handleUpdateGPSData(request, env);
   }
 
+  // Upload all activities endpoint (GPS and non-GPS)
+  if (url.pathname === '/update-all-activities' && request.method === 'POST') {
+    return handleUpdateAllActivities(request, env);
+  }
+
   if (url.pathname === '/status') {
     const lastSync = await getLastSyncTime(env);
     return new Response(JSON.stringify({
@@ -1071,10 +1076,13 @@ function processActivityData(activity) {
   };
   
   // Process strength training activities
-  if (activity.activityType?.typeKey === 'strength_training' && activity.fullExerciseSets) {
-    const processedSets = processExerciseSets(activity.fullExerciseSets);
-    baseActivity.exerciseSets = processedSets.exerciseSets;
-    baseActivity.workoutTiming = processedSets.workoutTiming;
+  if (activity.activityType?.typeKey === 'strength_training') {
+    if (activity.fullExerciseSets) {
+      const processedSets = processExerciseSets(activity.fullExerciseSets);
+      baseActivity.exerciseSets = processedSets.exerciseSets;
+      baseActivity.workoutTiming = processedSets.workoutTiming;
+    }
+    // Include strength training totals from the activity (from Garmin API)
     baseActivity.totalReps = activity.totalReps;
     baseActivity.totalSets = activity.totalSets;
   }
@@ -1198,6 +1206,20 @@ async function shouldUpdateActivity(existing, newActivity) {
 }
 
 async function storeActivity(activity, env) {
+  // Helper function to convert undefined to null for database compatibility
+  const nullIfUndefined = (value) => value === undefined ? null : value;
+  
+  // Log strength training data being stored
+  if (activity.type === 'strength_training' || activity.type === 'strength') {
+    console.log(`💪 Storing strength training activity ${activity.id}:`, {
+      totalReps: activity.totalReps,
+      totalSets: activity.totalSets,
+      hasExerciseSets: !!(activity.exerciseSets && activity.exerciseSets.length > 0),
+      hasWorkoutTiming: !!activity.workoutTiming,
+      workoutTiming: activity.workoutTiming
+    });
+  }
+  
   // Store main activity data
   const activityQuery = `
     INSERT OR REPLACE INTO ${ACTIVITIES_TABLE} 
@@ -1238,68 +1260,104 @@ async function storeActivity(activity, env) {
   }
   
   await env.DATABASE.prepare(activityQuery).bind(
-    activity.id, activity.name, activity.type, activity.startTime,
-    activity.duration, activity.movingTime, activity.calories,
-    activity.averageHR, activity.maxHR, activity.distance,
-    activity.averageSpeed, activity.maxSpeed, activity.elevationGain,
-    activity.elevationLoss, activity.averagePower, activity.maxPower,
-    activity.normalizedPower, activity.trainingStressScore,
-    activity.averageCadence, activity.maxCadence, activity.totalReps,
-    activity.totalSets, 
+    nullIfUndefined(activity.id), 
+    nullIfUndefined(activity.name), 
+    nullIfUndefined(activity.type), 
+    nullIfUndefined(activity.startTime),
+    nullIfUndefined(activity.duration), 
+    nullIfUndefined(activity.movingTime), 
+    nullIfUndefined(activity.calories),
+    nullIfUndefined(activity.averageHR), 
+    nullIfUndefined(activity.maxHR), 
+    nullIfUndefined(activity.distance),
+    nullIfUndefined(activity.averageSpeed), 
+    nullIfUndefined(activity.maxSpeed), 
+    nullIfUndefined(activity.elevationGain),
+    nullIfUndefined(activity.elevationLoss), 
+    nullIfUndefined(activity.averagePower), 
+    nullIfUndefined(activity.maxPower),
+    nullIfUndefined(activity.normalizedPower), 
+    nullIfUndefined(activity.trainingStressScore),
+    nullIfUndefined(activity.averageCadence), 
+    nullIfUndefined(activity.maxCadence), 
+    nullIfUndefined(activity.totalReps),
+    nullIfUndefined(activity.totalSets), 
     // GPS data - store GPS points as JSON or existing polyline
     gpsPolyline,
-    activity.gpsData?.startLatitude || null,
-    activity.gpsData?.startLongitude || null,
-    activity.gpsData?.endLatitude || null,
-    activity.gpsData?.endLongitude || null,
+    nullIfUndefined(activity.gpsData?.startLatitude),
+    nullIfUndefined(activity.gpsData?.startLongitude),
+    nullIfUndefined(activity.gpsData?.endLatitude),
+    nullIfUndefined(activity.gpsData?.endLongitude),
     totalGpsPoints,
     activity.gpsData?.hasPolyline || false,
     // Weather data
-    activity.weatherData?.temperature || null,
-    activity.weatherData?.apparentTemperature || null,
-    activity.weatherData?.humidity || null,
-    activity.weatherData?.dewPoint || null,
-    activity.weatherData?.windSpeed || null,
-    activity.weatherData?.windDirection || null,
-    activity.weatherData?.windDirectionCompass || null,
-    activity.weatherData?.windGust || null,
-    activity.weatherData?.weatherDescription || null,
-    activity.weatherData?.weatherStation || null,
-    activity.weatherData?.issueDate || null,
+    nullIfUndefined(activity.weatherData?.temperature),
+    nullIfUndefined(activity.weatherData?.apparentTemperature),
+    nullIfUndefined(activity.weatherData?.humidity),
+    nullIfUndefined(activity.weatherData?.dewPoint),
+    nullIfUndefined(activity.weatherData?.windSpeed),
+    nullIfUndefined(activity.weatherData?.windDirection),
+    nullIfUndefined(activity.weatherData?.windDirectionCompass),
+    nullIfUndefined(activity.weatherData?.windGust),
+    nullIfUndefined(activity.weatherData?.weatherDescription),
+    nullIfUndefined(activity.weatherData?.weatherStation),
+    nullIfUndefined(activity.weatherData?.issueDate),
     activity.weatherData?.hasWeatherData || false,
     // Workout timing data
-    activity.workoutTiming?.totalWorkingTime || null,
-    activity.workoutTiming?.totalRestTime || null,
-    activity.workoutTiming?.workToRestRatio || null,
-    activity.workoutTiming?.workPercentage || null,
-    activity.createdAt, activity.updatedAt
+    nullIfUndefined(activity.workoutTiming?.totalWorkingTime),
+    nullIfUndefined(activity.workoutTiming?.totalRestTime),
+    nullIfUndefined(activity.workoutTiming?.workToRestRatio),
+    nullIfUndefined(activity.workoutTiming?.workPercentage),
+    nullIfUndefined(activity.createdAt), 
+    nullIfUndefined(activity.updatedAt)
   ).run();
   
   // Store exercise sets for strength training
   if (activity.exerciseSets && activity.exerciseSets.length > 0) {
+    console.log(`💪 Storing exercise sets for activity ${activity.id}:`, {
+      exerciseCount: activity.exerciseSets.length,
+      totalSetsToStore: activity.exerciseSets.reduce((total, exercise) => total + (exercise.sets ? exercise.sets.length : 0), 0)
+    });
+    
     // First, delete existing exercise sets for this activity
     await env.DATABASE.prepare(`DELETE FROM ${EXERCISE_SETS_TABLE} WHERE activity_id = ?`)
       .bind(activity.id).run();
     
     // Insert new exercise sets
+    let totalInserted = 0;
     for (const exercise of activity.exerciseSets) {
-      for (let i = 0; i < exercise.sets.length; i++) {
-        const set = exercise.sets[i];
-        const setQuery = `
-          INSERT INTO ${EXERCISE_SETS_TABLE}
-          (activity_id, exercise_name, category, set_number, reps, weight, duration, start_time,
-           total_working_time, total_reps, total_volume, total_sets, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `;
-        
-        await env.DATABASE.prepare(setQuery).bind(
-          activity.id, exercise.exerciseName, exercise.category,
-          i + 1, set.reps, set.weight, set.duration, set.startTime,
-          exercise.totalWorkingTime, exercise.totalReps, exercise.totalVolume, exercise.totalSets,
-          activity.createdAt
-        ).run();
+      if (exercise.sets && Array.isArray(exercise.sets)) {
+        for (let i = 0; i < exercise.sets.length; i++) {
+          const set = exercise.sets[i];
+          const setQuery = `
+            INSERT INTO ${EXERCISE_SETS_TABLE}
+            (activity_id, exercise_name, category, set_number, reps, weight, duration, start_time,
+             total_working_time, total_reps, total_volume, total_sets, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `;
+          
+          await env.DATABASE.prepare(setQuery).bind(
+            nullIfUndefined(activity.id), 
+            nullIfUndefined(exercise.exerciseName), 
+            nullIfUndefined(exercise.category),
+            i + 1, 
+            nullIfUndefined(set.reps), 
+            nullIfUndefined(set.weight), 
+            nullIfUndefined(set.duration), 
+            nullIfUndefined(set.startTime),
+            nullIfUndefined(exercise.totalWorkingTime), 
+            nullIfUndefined(exercise.totalReps), 
+            nullIfUndefined(exercise.totalVolume), 
+            nullIfUndefined(exercise.totalSets),
+            nullIfUndefined(activity.createdAt)
+          ).run();
+          totalInserted++;
+        }
       }
     }
+    console.log(`✅ Inserted ${totalInserted} exercise sets for activity ${activity.id}`);
+  } else if (activity.type === 'strength_training' || activity.type === 'strength') {
+    console.log(`⚠️ Strength training activity ${activity.id} has no exercise sets data`);
   }
 }
 
@@ -1570,6 +1628,161 @@ async function handleUpdateGPSData(request, env) {
 
   } catch (error) {
     console.error('❌ Error handling GPS update request:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), { 
+      status: 500,
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Handle request to update all activities (with and without GPS data)
+ */
+async function handleUpdateAllActivities(request, env) {
+  try {
+    const body = await request.json();
+    const activities = body.activities || [];
+    const batchSize = parseInt(body.batchSize) || 50; // Process in smaller batches
+    const startIndex = parseInt(body.startIndex) || 0;
+
+    if (!Array.isArray(activities) || activities.length === 0) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'No activities provided'
+      }), { 
+        status: 400,
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // Process only a batch of activities to avoid timeout
+    const batch = activities.slice(startIndex, startIndex + batchSize);
+    const totalActivities = activities.length;
+    
+    console.log(`📥 Processing batch ${Math.floor(startIndex / batchSize) + 1}: activities ${startIndex + 1}-${Math.min(startIndex + batchSize, totalActivities)} of ${totalActivities}`);
+
+    let imported = 0;
+    let errors = 0;
+    const errorDetails = [];
+
+    // Process activities in parallel for better performance (but with concurrency limit)
+    const concurrencyLimit = 5;
+    const results = [];
+    
+    for (let i = 0; i < batch.length; i += concurrencyLimit) {
+      const chunk = batch.slice(i, i + concurrencyLimit);
+      const chunkPromises = chunk.map(async (activity) => {
+        try {
+        const { activityId, activityData, gpsData, weatherData, exerciseSets, workoutTiming } = activity;
+
+        // Log strength training data for debugging
+        if (activityData.type === 'strength_training' || activityData.type === 'strength') {
+          console.log(`💪 Processing strength training activity ${activityId}:`, {
+            name: activityData.name,
+            totalReps: activityData.totalReps,
+            totalSets: activityData.totalSets,
+            hasExerciseSets: !!(exerciseSets && exerciseSets.length > 0),
+            hasWorkoutTiming: !!workoutTiming,
+            exerciseSetCount: exerciseSets ? exerciseSets.length : 0,
+            workoutTimingData: workoutTiming
+          });
+        }
+
+        // Prepare the full activity object for storage
+        const fullActivity = {
+          id: activityId,
+          name: activityData.name,
+          type: activityData.type,
+          startTime: activityData.startTime,
+          duration: activityData.duration,
+          movingTime: activityData.movingTime,
+          calories: activityData.calories,
+          averageHR: activityData.averageHR,
+          maxHR: activityData.maxHR,
+          distance: activityData.distance,
+          averageSpeed: activityData.averageSpeed,
+          maxSpeed: activityData.maxSpeed,
+          elevationGain: activityData.elevationGain,
+          elevationLoss: activityData.elevationLoss,
+          // Include strength training fields
+          totalReps: activityData.totalReps,
+          totalSets: activityData.totalSets,
+          // Include cycling/running fields
+          averagePower: activityData.averagePower,
+          maxPower: activityData.maxPower,
+          normalizedPower: activityData.normalizedPower,
+          trainingStressScore: activityData.trainingStressScore,
+          averageCadence: activityData.averageCadence,
+          maxCadence: activityData.maxCadence,
+          createdAt: activityData.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          gpsData: gpsData,
+          weatherData: weatherData,
+          // Include strength training data
+          exerciseSets: exerciseSets,
+          workoutTiming: workoutTiming
+        };
+
+        // Store the complete activity
+        await storeActivity(fullActivity, env);
+        console.log(`✅ Imported activity ${activityId}: ${activityData.name || 'Unknown'}`);
+        return { success: true, activityId };
+
+        } catch (error) {
+          console.error(`❌ Error importing activity ${activity.activityId}:`, error);
+          return { success: false, activityId: activity.activityId, error: error.message };
+        }
+      });
+
+      const chunkResults = await Promise.all(chunkPromises);
+      results.push(...chunkResults);
+    }
+
+    // Count results
+    results.forEach(result => {
+      if (result.success) {
+        imported++;
+      } else {
+        errors++;
+        errorDetails.push({ activityId: result.activityId, error: result.error });
+      }
+    });
+
+    const isLastBatch = startIndex + batchSize >= totalActivities;
+    const nextStartIndex = isLastBatch ? null : startIndex + batchSize;
+    const progress = Math.round(((startIndex + batch.length) / totalActivities) * 100);
+
+    console.log(`🎉 Batch completed: ${imported} imported, ${errors} errors. Progress: ${progress}%`);
+
+    return new Response(JSON.stringify({
+      success: true,
+      imported: imported,
+      errors: errors,
+      batchSize: batch.length,
+      totalActivities: totalActivities,
+      progress: progress,
+      isComplete: isLastBatch,
+      nextStartIndex: nextStartIndex,
+      errorDetails: errorDetails.slice(0, 10), // Limit error details to prevent large responses
+      message: `Batch processed: ${imported} imported, ${errors} errors. ${isLastBatch ? 'Upload complete!' : `Continue from index ${nextStartIndex}`}`
+    }), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error processing batch:', error);
     return new Response(JSON.stringify({
       success: false,
       error: error.message
