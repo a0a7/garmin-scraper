@@ -90,6 +90,14 @@ async function handleRequest(request, env, ctx) {
   if (url.pathname === '/auth/ridewithgps/callback' && request.method === 'GET') {
     return handleRideWithGPSCallback(request, env);
   }
+
+  // Test Ride with GPS API endpoint
+  if (url.pathname === '/test-ridewithgps' && request.method === 'GET') {
+    const result = await testRideWithGPSAPI(env);
+    return new Response(JSON.stringify(result), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
   
   // Health check endpoint
   if (url.pathname === '/health') {
@@ -151,12 +159,106 @@ async function processRideWithGPSWebhook(request, env) {
 }
 
 /**
+ * Test Ride with GPS API connection using OAuth token
+ */
+async function testRideWithGPSAPI(env) {
+  try {
+    const accessToken = await env.GARMIN_SYNC_KV.get('ridewithgps_access_token');
+    if (!accessToken) {
+      return { 
+        success: false, 
+        error: 'No access token found. Please authenticate first.',
+        authUrl: '/auth/ridewithgps'
+      };
+    }
+
+    // Test API call to get user info
+    const response = await fetch('https://ridewithgps.com/users/current.json', {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`
+      }
+    });
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        return { 
+          success: false, 
+          error: 'Access token expired. Please re-authenticate.',
+          authUrl: '/auth/ridewithgps'
+        };
+      }
+      return { 
+        success: false, 
+        error: `API call failed: ${response.status} ${response.statusText}`,
+        details: await response.text().catch(() => 'No details available')
+      };
+    }
+
+    const userData = await response.json();
+    return { 
+      success: true, 
+      message: 'Successfully connected to Ride with GPS',
+      user: {
+        id: userData.user?.id,
+        name: userData.user?.name || userData.user?.display_name,
+        email: userData.user?.email
+      }
+    };
+
+  } catch (error) {
+    return { 
+      success: false, 
+      error: error.message 
+    };
+  }
+}
+
+/**
+ * Make authenticated request to Ride with GPS API using OAuth token
+ */
+async function makeRideWithGPSRequest(endpoint, env, options = {}) {
+  const accessToken = await env.GARMIN_SYNC_KV.get('ridewithgps_access_token');
+  if (!accessToken) {
+    throw new Error('No access token found. Please authenticate first.');
+  }
+
+  const url = endpoint.startsWith('http') ? endpoint : `https://ridewithgps.com${endpoint}`;
+  
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  });
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error('Access token expired. Please re-authenticate.');
+    }
+    throw new Error(`Ride with GPS API error: ${response.status} ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+/**
  * Handle Ride with GPS OAuth authentication
  */
 async function handleRideWithGPSAuth(request, env) {
   const apiKey = env.RIDEWITHGPS_API_KEY;
   const baseUrl = new URL(request.url).origin;
   const redirectUri = `${baseUrl}/auth/ridewithgps/callback`;
+  
+  if (!apiKey) {
+    return new Response(`
+      <html><body>
+        <h1>❌ Configuration Error</h1>
+        <p>RIDEWITHGPS_API_KEY not configured. Please set it in your Cloudflare secrets.</p>
+      </body></html>
+    `, { headers: { 'Content-Type': 'text/html' } });
+  }
   
   // Ride with GPS OAuth URL
   const authUrl = new URL('https://ridewithgps.com/oauth/authorize');
@@ -197,8 +299,8 @@ async function handleRideWithGPSAuth(request, env) {
             <p><small>You'll be redirected to Ride with GPS to authorize this application.</small></p>
             
             <div style="margin-top: 40px;">
-                <h3>Webhook Setup</h3>
-                <p>After authentication, configure your webhook URL in Ride with GPS:</p>
+                <h3>Webhook Setup (After Authentication)</h3>
+                <p>Configure your webhook URL in Ride with GPS:</p>
                 <code>${baseUrl}/ridewithgps-webhook</code>
             </div>
         </div>
@@ -249,6 +351,11 @@ async function handleRideWithGPSCallback(request, env) {
       })
     });
 
+    if (!tokenResponse.ok) {
+      const errorText = await tokenResponse.text();
+      throw new Error(`Token exchange failed: ${tokenResponse.status} ${errorText}`);
+    }
+
     const tokenData = await tokenResponse.json();
 
     if (tokenData.access_token) {
@@ -264,18 +371,19 @@ async function handleRideWithGPSCallback(request, env) {
       const userData = await userResponse.json();
 
       return new Response(`
-        <html><body>
+        <html><body style="font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px;">
           <h1>✅ Authentication Successful</h1>
-          <p>Connected to Ride with GPS account: ${userData.user?.name || 'Unknown'}</p>
+          <p>Connected to Ride with GPS account: <strong>${userData.user?.name || 'Unknown'}</strong></p>
           <div style="background: #f0f8ff; padding: 15px; border-radius: 4px; margin: 20px 0;">
             <h3>Next Steps:</h3>
             <ol>
-              <li>Set up webhook in Ride with GPS dashboard</li>
-              <li>Use this URL: <code>${new URL(request.url).origin}/ridewithgps-webhook</code></li>
-              <li>Select events: Activity Created, Activity Updated</li>
+              <li>Set up webhook in your Ride with GPS account</li>
+              <li>Go to: <strong>Account → API → Webhooks</strong></li>
+              <li>Add this URL: <code>${new URL(request.url).origin}/ridewithgps-webhook</code></li>
+              <li>Select events: <strong>Activity Created</strong>, <strong>Activity Updated</strong></li>
             </ol>
           </div>
-          <p><a href="/status">Check sync status</a></p>
+          <p><a href="/status" style="color: #007cba;">Check sync status</a> | <a href="/test-ridewithgps" style="color: #007cba;">Test connection</a></p>
         </body></html>
       `, { headers: { 'Content-Type': 'text/html' } });
     } else {
@@ -349,17 +457,29 @@ async function authenticateGarmin(env) {
       throw new Error('Garmin credentials not provided');
     }
 
-    // Step 1: Get login form
+    console.log('Starting Garmin authentication...');
+
+    // Step 1: Get login form and cookies
     const loginPageResponse = await fetch(`${GARMIN_SSO_URL}/signin`, {
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
       }
     });
+
+    if (!loginPageResponse.ok) {
+      throw new Error(`Failed to get login page: ${loginPageResponse.status}`);
+    }
 
     const loginPage = await loginPageResponse.text();
     const csrfMatch = loginPage.match(/name="_csrf"\s+value="([^"]+)"/);
     const csrfToken = csrfMatch ? csrfMatch[1] : '';
+    
+    // Extract cookies from login page
+    const setCookieHeaders = loginPageResponse.headers.get('set-cookie');
+    const cookies = setCookieHeaders ? setCookieHeaders.split(';')[0] : '';
+
+    console.log('Got CSRF token and cookies');
 
     // Step 2: Submit login credentials
     const loginData = new FormData();
@@ -371,66 +491,84 @@ async function authenticateGarmin(env) {
       method: 'POST',
       body: loginData,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': `${GARMIN_SSO_URL}/signin`
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Referer': `${GARMIN_SSO_URL}/signin`,
+        'Cookie': cookies
       },
       redirect: 'manual'
     });
 
-    // Step 3: Follow redirects to get session cookies
+    console.log(`Login response status: ${loginResponse.status}`);
+
+    // Collect all cookies during redirect chain
+    let allCookies = cookies;
+    const newCookies = loginResponse.headers.get('set-cookie');
+    if (newCookies) {
+      allCookies += '; ' + newCookies.split(';')[0];
+    }
+
+    // Step 3: Follow redirects to complete authentication
     let response = loginResponse;
     let redirectCount = 0;
-    const maxRedirects = 5;
+    const maxRedirects = 10;
     
     while (response.status >= 300 && response.status < 400 && redirectCount < maxRedirects) {
       const location = response.headers.get('location');
       if (!location) break;
       
+      console.log(`Following redirect ${redirectCount + 1}: ${location}`);
+      
       response = await fetch(location, {
         method: 'GET',
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Cookie': allCookies
         },
         redirect: 'manual'
       });
+      
+      // Collect more cookies
+      const moreCookies = response.headers.get('set-cookie');
+      if (moreCookies) {
+        allCookies += '; ' + moreCookies.split(';')[0];
+      }
+      
       redirectCount++;
     }
 
-    // Step 4: Make a request to get auth token
-    const activitiesResponse = await fetch(`${GARMIN_BASE_URL}/activitylist-service/activities/search/activities?limit=1&start=0`, {
+    console.log('Authentication redirects completed, testing API access...');
+
+    // Step 4: Test authenticated API access
+    const testResponse = await fetch(`${GARMIN_BASE_URL}/activitylist-service/activities/search/activities?limit=1&start=0`, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': `${GARMIN_BASE_URL}/modern/activities`,
+        'Cookie': allCookies
       }
     });
 
-    // Extract auth header from request headers (this is a simplified approach)
-    // In practice, you'd need to extract the Bearer token from the authentication flow
-    const authHeader = response.headers.get('authorization') || 
-                      `Bearer ${await getBearerTokenFromResponse(activitiesResponse)}`;
+    if (!testResponse.ok) {
+      throw new Error(`API test failed: ${testResponse.status} ${testResponse.statusText}`);
+    }
+
+    console.log('Garmin authentication successful');
     
-    return authHeader;
+    // Return the cookies as the "auth header" - we'll use this for subsequent requests
+    return allCookies;
     
   } catch (error) {
-    console.error('Authentication failed:', error);
+    console.error('Garmin authentication failed:', error);
     return null;
   }
 }
 
 /**
- * Extract bearer token from response (implement based on Garmin's actual auth flow)
- */
-async function getBearerTokenFromResponse(response) {
-  // This is a placeholder - you'll need to implement the actual token extraction
-  // based on how Garmin's authentication works in your browser extension
-  return 'placeholder-token';
-}
-
-/**
  * Fetch activities from Garmin Connect
  */
-async function fetchActivities(authHeader, lastSyncTime, isInitialSync) {
+async function fetchActivities(cookieHeader, lastSyncTime, isInitialSync) {
   const allActivities = [];
   let start = 0;
   let hasMore = true;
@@ -442,9 +580,11 @@ async function fetchActivities(authHeader, lastSyncTime, isInitialSync) {
     const response = await fetch(url, {
       headers: {
         'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Authorization': authHeader,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'X-Requested-With': 'XMLHttpRequest'
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': `${GARMIN_BASE_URL}/modern/activities`,
+        'Cookie': cookieHeader
       }
     });
     
@@ -529,15 +669,17 @@ async function processAndStoreActivities(activities, authHeader, env) {
 /**
  * Fetch exercise sets for a strength training activity
  */
-async function fetchActivityExerciseSets(activityId, authHeader) {
+async function fetchActivityExerciseSets(activityId, cookieHeader) {
   try {
     const url = `${GARMIN_BASE_URL}/activity-service/activity/${activityId}/exerciseSets`;
     const response = await fetch(url, {
       headers: {
         'Accept': 'application/json',
-        'Authorization': authHeader,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'X-Requested-With': 'XMLHttpRequest'
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': `${GARMIN_BASE_URL}/modern/activity/${activityId}`,
+        'Cookie': cookieHeader
       }
     });
     

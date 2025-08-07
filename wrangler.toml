@@ -12,8 +12,8 @@ command = ""
 [triggers]
 crons = ["0 2 * * *"]
 
-# Secrets are managed via Cloudflare dashboard or wrangler secret put commands
-# Do not put actual secret values in this file!
+[observability.logs]
+enabled = true
 
 # KV namespace for storing sync metadata
 [[kv_namespaces]]
@@ -31,3 +31,4 @@ database_id = "add4c323-2167-4a1b-a52c-4a530f0c0762"
 # [[durable_objects.bindings]]
 # name = "GARMIN_SYNC_STATE"
 # class_name = "GarminSyncState"
+
