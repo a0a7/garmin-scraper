@@ -104,7 +104,10 @@ async function handleRequest(request, env, ctx) {
     return new Response('OK', { status: 200 });
   }
 
-  // Status endpoint to check last sync
+  // Add import endpoint for bulk data import
+  if (url.pathname === '/import-data' && request.method === 'POST') {
+    return handleDataImport(request, env);
+  }
   if (url.pathname === '/status') {
     const lastSync = await getLastSyncTime(env);
     return new Response(JSON.stringify({
@@ -825,6 +828,17 @@ async function processAndStoreActivities(activities, authData, env) {
         activity.fullExerciseSets = await fetchActivityExerciseSets(activity.activityId, authData);
       }
       
+      // Enrich GPS activities with route data
+      if (activity.distance && activity.distance > 0 && ['running', 'cycling', 'walking', 'hiking', 'mountain_biking'].includes(activity.activityType?.typeKey)) {
+        activity.gpsData = await fetchActivityRouteData(activity.activityId, authData);
+      }
+      
+      // Enrich outdoor activities with weather data
+      const outdoorActivities = ['running', 'cycling', 'walking', 'hiking', 'mountain_biking', 'road_biking', 'trail_running'];
+      if (outdoorActivities.includes(activity.activityType?.typeKey)) {
+        activity.weatherData = await fetchActivityWeatherData(activity.activityId, authData);
+      }
+      
       // Process activity data
       const processedActivity = processActivityData(activity);
       
@@ -873,6 +887,90 @@ async function fetchActivityExerciseSets(activityId, authData) {
 }
 
 /**
+ * Fetch GPS route data for an activity
+ */
+async function fetchActivityRouteData(activityId, authData) {
+  try {
+    const url = `${GARMIN_BASE_URL}/activity-service/activity/${activityId}`;
+    
+    const headers = {
+      'Accept': 'application/json',
+      'User-Agent': 'com.garmin.android.apps.connectmobile',
+      'Authorization': `Bearer ${authData.bearerToken}`
+    };
+
+    const response = await fetch(url, { headers });
+    
+    if (!response.ok) {
+      console.warn(`Failed to fetch route data for ${activityId}`);
+      return { hasPolyline: false };
+    }
+    
+    const data = await response.json();
+    
+    if (data.geoPolylineDTO && data.geoPolylineDTO.polyline) {
+      return {
+        polyline: data.geoPolylineDTO.polyline,
+        startLatitude: data.geoPolylineDTO.startLatitude,
+        startLongitude: data.geoPolylineDTO.startLongitude,
+        endLatitude: data.geoPolylineDTO.endLatitude,
+        endLongitude: data.geoPolylineDTO.endLongitude,
+        hasPolyline: true
+      };
+    } else {
+      return { hasPolyline: false };
+    }
+    
+  } catch (error) {
+    console.error(`Error fetching route data for ${activityId}:`, error);
+    return { hasPolyline: false };
+  }
+}
+
+/**
+ * Fetch weather data for an activity
+ */
+async function fetchActivityWeatherData(activityId, authData) {
+  try {
+    const url = `${GARMIN_BASE_URL}/activity-service/activity/${activityId}/weather?_=${Date.now()}`;
+    
+    const headers = {
+      'Accept': 'application/json',
+      'User-Agent': 'com.garmin.android.apps.connectmobile',
+      'Authorization': `Bearer ${authData.bearerToken}`
+    };
+
+    const response = await fetch(url, { headers });
+    
+    if (!response.ok) {
+      console.warn(`Failed to fetch weather data for ${activityId}`);
+      return { hasWeatherData: false };
+    }
+    
+    const weather = await response.json();
+    
+    return {
+      temperature: weather.temp,
+      apparentTemperature: weather.apparentTemp,
+      humidity: weather.relativeHumidity,
+      dewPoint: weather.dewPoint,
+      windSpeed: weather.windSpeed,
+      windDirection: weather.windDirection,
+      windDirectionCompass: weather.windDirectionCompassPoint,
+      windGust: weather.windGust,
+      weatherDescription: weather.weatherTypeDTO?.desc,
+      weatherStation: weather.weatherStationDTO?.name,
+      issueDate: weather.issueDate,
+      hasWeatherData: true
+    };
+    
+  } catch (error) {
+    console.error(`Error fetching weather data for ${activityId}:`, error);
+    return { hasWeatherData: false };
+  }
+}
+
+/**
  * Process activity data based on type
  */
 function processActivityData(activity) {
@@ -897,9 +995,21 @@ function processActivityData(activity) {
   
   // Process strength training activities
   if (activity.activityType?.typeKey === 'strength_training' && activity.fullExerciseSets) {
-    baseActivity.exerciseSets = processExerciseSets(activity.fullExerciseSets);
+    const processedSets = processExerciseSets(activity.fullExerciseSets);
+    baseActivity.exerciseSets = processedSets.exerciseSets;
+    baseActivity.workoutTiming = processedSets.workoutTiming;
     baseActivity.totalReps = activity.totalReps;
     baseActivity.totalSets = activity.totalSets;
+  }
+  
+  // Process GPS activities
+  if (activity.gpsData) {
+    baseActivity.gpsData = activity.gpsData;
+  }
+  
+  // Process weather data
+  if (activity.weatherData) {
+    baseActivity.weatherData = activity.weatherData;
   }
   
   // Process cycling/running activities
@@ -916,32 +1026,65 @@ function processActivityData(activity) {
 }
 
 /**
- * Process exercise sets data similar to sample-file-processor.svelte
+ * Process exercise sets data with working/rest time calculations
  */
 function processExerciseSets(exerciseSets) {
-  return exerciseSets.map(exerciseSet => {
-    const sets = [];
-    
-    if (exerciseSet.sets && Array.isArray(exerciseSet.sets)) {
-      exerciseSet.sets.forEach(set => {
-        // Include all sets without filtering
-        sets.push({
-          reps: set.repetitionCount || 0,
-          weight: set.weight ? Math.round(set.weight / 1000 * 100) / 100 : null, // Convert grams to kg
-          duration: set.duration,
-          restTime: set.restTime
-        });
+  // Group sets by exercise type
+  const exerciseGroups = {};
+  const activeSets = exerciseSets.filter(set => set.setType === 'ACTIVE');
+  const restSets = exerciseSets.filter(set => set.setType === 'REST');
+  
+  // Calculate total working vs rest time
+  const totalWorkingTime = activeSets.reduce((sum, set) => sum + (set.duration || 0), 0);
+  const totalRestTime = restSets.reduce((sum, set) => sum + (set.duration || 0), 0);
+  
+  activeSets.forEach(set => {
+    if (set.exercises && set.exercises.length > 0) {
+      const exercise = set.exercises[0];
+      const exerciseKey = exercise.category + (exercise.name ? `_${exercise.name}` : '');
+      
+      if (!exerciseGroups[exerciseKey]) {
+        exerciseGroups[exerciseKey] = {
+          exerciseName: exercise.name || exercise.category,
+          category: exercise.category,
+          sets: [],
+          totalWorkingTime: 0
+        };
+      }
+      
+      exerciseGroups[exerciseKey].sets.push({
+        reps: set.repetitionCount || 0,
+        weight: set.weight ? Math.round(set.weight / 1000 * 100) / 100 : null, // Convert from milligrams to kg
+        duration: set.duration,
+        startTime: set.startTime
       });
+      
+      exerciseGroups[exerciseKey].totalWorkingTime += (set.duration || 0);
     }
-    
-    return {
-      exerciseName: exerciseSet.exerciseName,
-      category: exerciseSet.category,
-      sets: sets,
-      totalReps: sets.reduce((sum, set) => sum + (set.reps || 0), 0),
-      totalVolume: sets.reduce((sum, set) => sum + ((set.reps || 0) * (set.weight || 0)), 0)
-    };
-  }); // Removed filter that excluded exercises with no sets
+  });
+  
+  // Convert to array format and calculate totals
+  const processedExercises = Object.values(exerciseGroups).map(exercise => ({
+    ...exercise,
+    totalReps: exercise.sets.reduce((sum, set) => sum + (set.reps || 0), 0),
+    totalVolume: exercise.sets.reduce((sum, set) => sum + ((set.reps || 0) * (set.weight || 0)), 0),
+    totalSets: exercise.sets.length,
+    totalWorkingTime: Math.round(exercise.totalWorkingTime) // seconds
+  }));
+  
+  // Calculate workout timing summary
+  const workoutTiming = {
+    totalWorkingTime: Math.round(totalWorkingTime), // seconds
+    totalRestTime: Math.round(totalRestTime), // seconds
+    totalTime: Math.round(totalWorkingTime + totalRestTime), // seconds
+    workToRestRatio: totalRestTime > 0 ? Math.round((totalWorkingTime / totalRestTime) * 100) / 100 : null,
+    workPercentage: totalWorkingTime + totalRestTime > 0 ? Math.round((totalWorkingTime / (totalWorkingTime + totalRestTime)) * 100) : 0
+  };
+  
+  return {
+    exerciseSets: processedExercises,
+    workoutTiming: workoutTiming
+  };
 }
 
 /**
@@ -978,8 +1121,18 @@ async function storeActivity(activity, env) {
      average_hr, max_hr, distance, average_speed, max_speed, 
      elevation_gain, elevation_loss, average_power, max_power,
      normalized_power, training_stress_score, average_cadence, max_cadence,
-     total_reps, total_sets, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     total_reps, total_sets, 
+     gps_polyline, start_latitude, start_longitude, end_latitude, end_longitude, has_gps_data,
+     temperature, apparent_temperature, humidity, dew_point, wind_speed, wind_direction,
+     wind_direction_compass, wind_gust, weather_description, weather_station, 
+     weather_issue_date, has_weather_data,
+     total_working_time, total_rest_time, work_to_rest_ratio, work_percentage,
+     created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
+            ?, ?, ?, ?, ?, ?, 
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?)
   `;
   
   await env.DATABASE.prepare(activityQuery).bind(
@@ -990,7 +1143,33 @@ async function storeActivity(activity, env) {
     activity.elevationLoss, activity.averagePower, activity.maxPower,
     activity.normalizedPower, activity.trainingStressScore,
     activity.averageCadence, activity.maxCadence, activity.totalReps,
-    activity.totalSets, activity.createdAt, activity.updatedAt
+    activity.totalSets, 
+    // GPS data
+    activity.gpsData?.polyline || null,
+    activity.gpsData?.startLatitude || null,
+    activity.gpsData?.startLongitude || null,
+    activity.gpsData?.endLatitude || null,
+    activity.gpsData?.endLongitude || null,
+    activity.gpsData?.hasPolyline || false,
+    // Weather data
+    activity.weatherData?.temperature || null,
+    activity.weatherData?.apparentTemperature || null,
+    activity.weatherData?.humidity || null,
+    activity.weatherData?.dewPoint || null,
+    activity.weatherData?.windSpeed || null,
+    activity.weatherData?.windDirection || null,
+    activity.weatherData?.windDirectionCompass || null,
+    activity.weatherData?.windGust || null,
+    activity.weatherData?.weatherDescription || null,
+    activity.weatherData?.weatherStation || null,
+    activity.weatherData?.issueDate || null,
+    activity.weatherData?.hasWeatherData || false,
+    // Workout timing data
+    activity.workoutTiming?.totalWorkingTime || null,
+    activity.workoutTiming?.totalRestTime || null,
+    activity.workoutTiming?.workToRestRatio || null,
+    activity.workoutTiming?.workPercentage || null,
+    activity.createdAt, activity.updatedAt
   ).run();
   
   // Store exercise sets for strength training
@@ -1005,14 +1184,16 @@ async function storeActivity(activity, env) {
         const set = exercise.sets[i];
         const setQuery = `
           INSERT INTO ${EXERCISE_SETS_TABLE}
-          (activity_id, exercise_name, category, set_number, reps, weight, duration, rest_time, total_volume)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (activity_id, exercise_name, category, set_number, reps, weight, duration, start_time,
+           total_working_time, total_reps, total_volume, total_sets, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
         
         await env.DATABASE.prepare(setQuery).bind(
           activity.id, exercise.exerciseName, exercise.category,
-          i + 1, set.reps, set.weight, set.duration, set.restTime,
-          set.reps * (set.weight || 0)
+          i + 1, set.reps, set.weight, set.duration, set.startTime,
+          exercise.totalWorkingTime, exercise.totalReps, exercise.totalVolume, exercise.totalSets,
+          activity.createdAt
         ).run();
       }
     }
@@ -1074,6 +1255,74 @@ async function generateOAuth1Signature(method, url, params, consumerSecret, toke
   const base64Signature = btoa(binary);
   
   return base64Signature;
+}
+
+/**
+ * Handle bulk data import from browser export
+ */
+async function handleDataImport(request, env) {
+  try {
+    const importData = await request.json();
+    
+    if (!importData.activities || !Array.isArray(importData.activities)) {
+      return new Response('Invalid data format', { status: 400 });
+    }
+    
+    console.log(`📥 Importing ${importData.activities.length} activities...`);
+    
+    let imported = 0;
+    let errors = 0;
+    
+    // Process in smaller batches to avoid limits
+    const BATCH_SIZE = 10;
+    const activities = importData.activities;
+    
+    for (let i = 0; i < activities.length; i += BATCH_SIZE) {
+      const batch = activities.slice(i, i + BATCH_SIZE);
+      
+      for (const activity of batch) {
+        try {
+          await storeActivity(activity, env);
+          imported++;
+          
+          if (imported % 50 === 0) {
+            console.log(`📊 Progress: ${imported}/${activities.length} activities imported`);
+          }
+          
+        } catch (error) {
+          console.error(`❌ Failed to import activity ${activity.id}:`, error);
+          errors++;
+        }
+      }
+      
+      // Small delay between batches
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    const result = {
+      success: true,
+      imported: imported,
+      errors: errors,
+      total: activities.length,
+      timestamp: new Date().toISOString()
+    };
+    
+    console.log(`✅ Import complete: ${imported} imported, ${errors} errors`);
+    
+    return new Response(JSON.stringify(result), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+  } catch (error) {
+    console.error('❌ Import failed:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), { 
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 // Export for testing
