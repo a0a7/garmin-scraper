@@ -158,6 +158,11 @@ async function handleRequest(request, env, ctx) {
     });
   }
 
+  // Strength activities endpoint with caching
+  if (url.pathname === '/strength-activities' && request.method === 'GET') {
+    return handleGetStrengthActivities(request, env);
+  }
+
   if (url.pathname === '/status') {
     const lastSync = await getLastSyncTime(env);
     return new Response(JSON.stringify({
@@ -173,7 +178,91 @@ async function handleRequest(request, env, ctx) {
   
   return new Response('Not Found', { status: 404 });
 }
+async function handleGetStrengthActivities(request, env) {
+  try {
+    // Try to get cached data first
+    let cached = await env.GARMIN_SYNC_KV.get('strength_activities_cache', { type: 'json' });
+    if (cached) {
+      return new Response(JSON.stringify({
+        success: true,
+        activities: cached.activities,
+        lastUpdated: cached.lastUpdated,
+        cached: true
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=3600'
+        }
+      });
+    }
+    // If not cached, generate and cache
+    const data = await generateStrengthActivities(env);
+    await env.GARMIN_SYNC_KV.put('strength_activities_cache', JSON.stringify(data));
+    return new Response(JSON.stringify({
+      success: true,
+      activities: data.activities,
+      lastUpdated: data.lastUpdated,
+      cached: false
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting strength activities:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
 
+/**
+ * Generate all strength activities with their set data
+ */
+async function generateStrengthActivities(env) {
+  // Get all strength activities
+  const activitiesQuery = `
+    SELECT * FROM activities
+    WHERE type = 'strength_training' OR type = 'strength'
+    ORDER BY start_time DESC
+  `;
+  const activities = (await env.DATABASE.prepare(activitiesQuery).all()).results;
+  // For each activity, get its sets
+  for (const activity of activities) {
+    const setsQuery = `SELECT * FROM exercise_sets WHERE activity_id = ? ORDER BY set_number ASC`;
+    const sets = (await env.DATABASE.prepare(setsQuery).bind(activity.id).all()).results;
+    activity.exercise_sets = sets;
+  }
+  return {
+    lastUpdated: new Date().toISOString(),
+    activities
+  };
+}
+
+/**
+ * Refresh strength activities cache
+ */
+async function refreshStrengthActivitiesCache(env) {
+  try {
+    const data = await generateStrengthActivities(env);
+    await env.GARMIN_SYNC_KV.put('strength_activities_cache', JSON.stringify(data));
+    console.log('📊 Strength activities cache refreshed');
+    return data;
+  } catch (error) {
+    console.error('❌ Error refreshing strength activities cache:', error);
+    throw error;
+  }
+}
 /**
  * Verify webhook signature (implement based on your webhook provider)
  */
@@ -2021,15 +2110,14 @@ async function handleUpdateAllActivities(request, env) {
 
     console.log(`🎉 Batch completed: ${imported} imported, ${errors} errors. Progress: ${progress}%`);
 
-    // Refresh stats cache and update sync time when the last batch is processed
+    // Refresh stats and strength activities cache, and update sync time when the last batch is processed
     if (isLastBatch) {
       console.log('📊 Refreshing activity statistics cache...');
       await refreshActivityStats(env);
-      
+      console.log('📊 Refreshing strength activities cache...');
+      await refreshStrengthActivitiesCache(env);
       // Update last sync time to the most recent activity date to prevent unnecessary syncs
       console.log('🕒 Updating last sync time after bulk upload...');
-      
-      // Find the most recent activity date from all activities
       let mostRecentDate = null;
       for (const activity of activities) {
         const activityDate = new Date(activity.activityData.startTime);
@@ -2037,12 +2125,14 @@ async function handleUpdateAllActivities(request, env) {
           mostRecentDate = activityDate;
         }
       }
-      
-      // Set sync time to the most recent activity date, or current time if no activities
       const syncTime = mostRecentDate ? mostRecentDate.toISOString() : new Date().toISOString();
       console.log(`Setting lastSyncTime to: ${syncTime}`);
       await env.GARMIN_SYNC_KV.put('lastSyncTime', syncTime);
     }
+/**
+ * Handle strength activities endpoint with caching
+ */
+
 
     return new Response(JSON.stringify({
       success: true,
