@@ -4,7 +4,7 @@
  */
 
 // Configuration
-const GARMIN_BASE_URL = 'https://connect.garmin.com';
+const GARMIN_BASE_URL = 'https://connectapi.garmin.com';
 const GARMIN_SSO_URL = 'https://sso.garmin.com';
 const PAGE_SIZE = 20;
 
@@ -407,8 +407,8 @@ async function handleRideWithGPSCallback(request, env) {
 async function syncGarminData(env) {
   try {
     // Authenticate with Garmin
-    const authHeader = await authenticateGarmin(env);
-    if (!authHeader) {
+    const authData = await authenticateGarmin(env);
+    if (!authData) {
       throw new Error('Failed to authenticate with Garmin');
     }
 
@@ -419,11 +419,11 @@ async function syncGarminData(env) {
     console.log(`Last sync: ${lastSyncTime || 'Never'}, Initial sync: ${isInitialSync}`);
 
     // Fetch activities since last sync
-    const activities = await fetchActivities(authHeader, lastSyncTime, isInitialSync);
+    const activities = await fetchActivities(authData, lastSyncTime, isInitialSync);
     console.log(`Fetched ${activities.length} activities`);
 
     // Process and store activities
-    const processedCount = await processAndStoreActivities(activities, authHeader, env);
+    const processedCount = await processAndStoreActivities(activities, authData, env);
     
     // Update last sync time
     await updateLastSyncTime(env);
@@ -446,7 +446,7 @@ async function syncGarminData(env) {
 }
 
 /**
- * Authenticate with Garmin Connect
+ * Authenticate with Garmin Connect using simplified OAuth flow similar to garth
  */
 async function authenticateGarmin(env) {
   try {
@@ -457,107 +457,287 @@ async function authenticateGarmin(env) {
       throw new Error('Garmin credentials not provided');
     }
 
-    console.log('Starting Garmin authentication...');
+    console.log('Starting Garmin authentication (garth-style)...');
 
-    // Step 1: Get login form and cookies
-    const loginPageResponse = await fetch(`${GARMIN_SSO_URL}/signin`, {
+    // Step 1: Get OAuth consumer keys (like garth does)
+    const consumerResponse = await fetch('https://thegarth.s3.amazonaws.com/oauth_consumer.json');
+    if (!consumerResponse.ok) {
+      throw new Error('Failed to get OAuth consumer keys');
+    }
+    const consumer = await consumerResponse.json();
+    console.log('Got OAuth consumer keys');
+
+    // Step 2: Set up SSO embed session
+    const domain = 'garmin.com';
+    const SSO = `https://sso.${domain}/sso`;
+    const SSO_EMBED = `${SSO}/embed`;
+    
+    const embedParams = {
+      id: 'gauth-widget',
+      embedWidget: 'true',
+      gauthHost: SSO
+    };
+
+    let cookies = '';
+
+    // Initial embed request to set cookies
+    const embedResponse = await fetch(`${SSO_EMBED}?${new URLSearchParams(embedParams)}`, {
       method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       }
     });
 
-    if (!loginPageResponse.ok) {
-      throw new Error(`Failed to get login page: ${loginPageResponse.status}`);
+    if (!embedResponse.ok) {
+      throw new Error(`Failed to initialize embed session: ${embedResponse.status}`);
     }
 
-    const loginPage = await loginPageResponse.text();
-    const csrfMatch = loginPage.match(/name="_csrf"\s+value="([^"]+)"/);
-    const csrfToken = csrfMatch ? csrfMatch[1] : '';
-    
-    // Extract cookies from login page
-    const setCookieHeaders = loginPageResponse.headers.get('set-cookie');
-    const cookies = setCookieHeaders ? setCookieHeaders.split(';')[0] : '';
+    // Collect cookies
+    const embedCookies = embedResponse.headers.get('set-cookie');
+    if (embedCookies) {
+      cookies = embedCookies.split(',').map(c => c.split(';')[0].trim()).join('; ');
+    }
 
-    console.log('Got CSRF token and cookies');
+    console.log('Initialized embed session');
 
-    // Step 2: Submit login credentials
-    const loginData = new FormData();
-    loginData.append('username', username);
-    loginData.append('password', password);
-    loginData.append('_csrf', csrfToken);
+    // Step 3: Get signin form with proper parameters
+    const signinParams = {
+      ...embedParams,
+      service: SSO_EMBED,
+      source: SSO_EMBED,
+      redirectAfterAccountLoginUrl: SSO_EMBED,
+      redirectAfterAccountCreationUrl: SSO_EMBED
+    };
 
-    const loginResponse = await fetch(`${GARMIN_SSO_URL}/signin`, {
-      method: 'POST',
-      body: loginData,
+    const signinFormResponse = await fetch(`${SSO}/signin?${new URLSearchParams(signinParams)}`, {
+      method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Referer': `${GARMIN_SSO_URL}/signin`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Referer': `${SSO_EMBED}?${new URLSearchParams(embedParams)}`,
+        'Cookie': cookies
+      }
+    });
+
+    if (!signinFormResponse.ok) {
+      throw new Error(`Failed to get signin form: ${signinFormResponse.status}`);
+    }
+
+    const signinHtml = await signinFormResponse.text();
+    
+    // Extract CSRF token
+    const csrfMatch = signinHtml.match(/name="_csrf"\s+value="([^"]+)"/);
+    if (!csrfMatch) {
+      throw new Error('Could not find CSRF token');
+    }
+    const csrfToken = csrfMatch[1];
+
+    // Update cookies
+    const formCookies = signinFormResponse.headers.get('set-cookie');
+    if (formCookies) {
+      const newCookies = formCookies.split(',').map(c => c.split(';')[0].trim()).join('; ');
+      cookies = cookies ? `${cookies}; ${newCookies}` : newCookies;
+    }
+
+    console.log('Got signin form and CSRF token');
+
+    // Step 4: Submit login credentials
+    const loginData = new URLSearchParams({
+      username: username,
+      password: password,
+      embed: 'true',
+      _csrf: csrfToken
+    });
+
+    const loginResponse = await fetch(`${SSO}/signin?${new URLSearchParams(signinParams)}`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': `${SSO}/signin?${new URLSearchParams(signinParams)}`,
         'Cookie': cookies
       },
-      redirect: 'manual'
+      body: loginData.toString()
     });
 
-    console.log(`Login response status: ${loginResponse.status}`);
-
-    // Collect all cookies during redirect chain
-    let allCookies = cookies;
-    const newCookies = loginResponse.headers.get('set-cookie');
-    if (newCookies) {
-      allCookies += '; ' + newCookies.split(';')[0];
+    if (!loginResponse.ok) {
+      throw new Error(`Login failed: ${loginResponse.status}`);
     }
 
-    // Step 3: Follow redirects to complete authentication
-    let response = loginResponse;
-    let redirectCount = 0;
-    const maxRedirects = 10;
+    const loginHtml = await loginResponse.text();
     
-    while (response.status >= 300 && response.status < 400 && redirectCount < maxRedirects) {
-      const location = response.headers.get('location');
-      if (!location) break;
-      
-      console.log(`Following redirect ${redirectCount + 1}: ${location}`);
-      
-      response = await fetch(location, {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Cookie': allCookies
-        },
-        redirect: 'manual'
-      });
-      
-      // Collect more cookies
-      const moreCookies = response.headers.get('set-cookie');
-      if (moreCookies) {
-        allCookies += '; ' + moreCookies.split(';')[0];
-      }
-      
-      redirectCount++;
+    // Update cookies from login
+    const loginCookies = loginResponse.headers.get('set-cookie');
+    if (loginCookies) {
+      const newCookies = loginCookies.split(',').map(c => c.split(';')[0].trim()).join('; ');
+      cookies = cookies ? `${cookies}; ${newCookies}` : newCookies;
     }
 
-    console.log('Authentication redirects completed, testing API access...');
+    // Check login success
+    const titleMatch = loginHtml.match(/<title>(.+?)<\/title>/);
+    const title = titleMatch ? titleMatch[1] : '';
+    
+    console.log(`Login response title: ${title}`);
 
-    // Step 4: Test authenticated API access
-    const testResponse = await fetch(`${GARMIN_BASE_URL}/activitylist-service/activities/search/activities?limit=1&start=0`, {
+    if (title !== 'Success' && !title.includes('Success')) {
+      throw new Error(`Login failed with title: ${title}`);
+    }
+
+    console.log('Login successful, extracting ticket...');
+
+    // Step 5: Extract ticket from response
+    const ticketMatch = loginHtml.match(/embed\?ticket=([^"]+)"/);
+    if (!ticketMatch) {
+      throw new Error('Could not find ticket in login response');
+    }
+
+    const ticket = ticketMatch[1];
+    console.log('Extracted authentication ticket');
+
+    // Step 6: Get OAuth1 preauthorized token using the ticket
+    const baseUrl = `https://connectapi.${domain}/oauth-service/oauth/`;
+    const loginUrl = `https://sso.${domain}/sso/embed`;
+    
+    // Create OAuth1 parameters for the preauthorized request
+    const oauthParams = {
+      'oauth_consumer_key': consumer.consumer_key,
+      'oauth_nonce': generateNonce(),
+      'oauth_signature_method': 'HMAC-SHA1',
+      'oauth_timestamp': Math.floor(Date.now() / 1000).toString(),
+      'oauth_version': '1.0',
+      'ticket': ticket,
+      'login-url': loginUrl,
+      'accepts-mfa-tokens': 'true'
+    };
+
+    // Generate OAuth1 signature
+    const preAuthUrl = `${baseUrl}preauthorized`;
+    const signature = await generateOAuth1Signature('GET', preAuthUrl, oauthParams, consumer.consumer_secret);
+    oauthParams.oauth_signature = signature;
+
+    // Build the request URL with all OAuth parameters
+    const queryParams = new URLSearchParams(oauthParams);
+    const fullPreAuthUrl = `${preAuthUrl}?${queryParams.toString()}`;
+
+    const oauth1Response = await fetch(fullPreAuthUrl, {
+      method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': `${GARMIN_BASE_URL}/modern/activities`,
-        'Cookie': allCookies
+        'User-Agent': 'com.garmin.android.apps.connectmobile',
+        'Accept': '*/*'
       }
     });
+
+    if (!oauth1Response.ok) {
+      const errorText = await oauth1Response.text().catch(() => 'No error details');
+      console.log(`OAuth1 response status: ${oauth1Response.status}`);
+      console.log(`OAuth1 error body:`, errorText);
+      throw new Error(`Failed to get OAuth1 token: ${oauth1Response.status} - ${errorText}`);
+    }
+
+    const oauth1Text = await oauth1Response.text();
+    console.log('Got OAuth1 response');
+
+    // Parse OAuth1 response (URL-encoded format)
+    const oauth1Params = new URLSearchParams(oauth1Text);
+    const oauth1Token = {
+      oauth_token: oauth1Params.get('oauth_token'),
+      oauth_token_secret: oauth1Params.get('oauth_token_secret'),
+      mfa_token: oauth1Params.get('mfa_token')
+    };
+
+    if (!oauth1Token.oauth_token || !oauth1Token.oauth_token_secret) {
+      throw new Error('Failed to extract OAuth1 token from response');
+    }
+
+    console.log('Successfully extracted OAuth1 token');
+
+    // Step 7: Exchange OAuth1 for OAuth2 Bearer token
+    const exchangeUrl = `${baseUrl}exchange/user/2.0`;
+    const exchangeBody = oauth1Token.mfa_token ? `mfa_token=${oauth1Token.mfa_token}` : '';
+
+    // Create OAuth1 parameters for the exchange request
+    const exchangeOAuthParams = {
+      'oauth_consumer_key': consumer.consumer_key,
+      'oauth_token': oauth1Token.oauth_token,
+      'oauth_nonce': generateNonce(),
+      'oauth_signature_method': 'HMAC-SHA1',
+      'oauth_timestamp': Math.floor(Date.now() / 1000).toString(),
+      'oauth_version': '1.0'
+    };
+
+    // Add mfa_token to OAuth parameters if present
+    if (oauth1Token.mfa_token) {
+      exchangeOAuthParams.mfa_token = oauth1Token.mfa_token;
+    }
+
+    // Generate OAuth1 signature for the exchange request
+    const exchangeSignature = await generateOAuth1Signature('POST', exchangeUrl, exchangeOAuthParams, consumer.consumer_secret, oauth1Token.oauth_token_secret);
+    exchangeOAuthParams.oauth_signature = exchangeSignature;
+
+    // Build the Authorization header
+    const oauthHeaderParams = [
+      `oauth_consumer_key="${encodeURIComponent(exchangeOAuthParams.oauth_consumer_key)}"`,
+      `oauth_token="${encodeURIComponent(exchangeOAuthParams.oauth_token)}"`,
+      `oauth_signature_method="${encodeURIComponent(exchangeOAuthParams.oauth_signature_method)}"`,
+      `oauth_timestamp="${encodeURIComponent(exchangeOAuthParams.oauth_timestamp)}"`,
+      `oauth_nonce="${encodeURIComponent(exchangeOAuthParams.oauth_nonce)}"`,
+      `oauth_version="${encodeURIComponent(exchangeOAuthParams.oauth_version)}"`,
+      `oauth_signature="${encodeURIComponent(exchangeOAuthParams.oauth_signature)}"`
+    ];
+    
+    const authHeader = `OAuth ${oauthHeaderParams.join(', ')}`;
+
+    const oauth2Response = await fetch(exchangeUrl, {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'com.garmin.android.apps.connectmobile',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': authHeader
+      },
+      body: exchangeBody
+    });
+
+    if (!oauth2Response.ok) {
+      const errorText = await oauth2Response.text();
+      throw new Error(`Failed to exchange OAuth1 for OAuth2: ${oauth2Response.status} - ${errorText}`);
+    }
+
+    const oauth2Data = await oauth2Response.json();
+    console.log('Successfully exchanged for OAuth2 token');
+    
+    if (!oauth2Data.access_token) {
+      throw new Error('No access_token in OAuth2 response');
+    }
+
+    // Step 8: Test the Bearer token with Garmin API
+    const testHeaders = {
+      'User-Agent': 'com.garmin.android.apps.connectmobile',
+      'Authorization': `Bearer ${oauth2Data.access_token}`,
+      'Accept': 'application/json'
+    };
+
+    const testResponse = await fetch(`${GARMIN_BASE_URL}/activitylist-service/activities/search/activities?limit=1&start=0`, {
+      headers: testHeaders
+    });
+
+    console.log(`API test response status: ${testResponse.status}`);
 
     if (!testResponse.ok) {
+      const responseText = await testResponse.text().catch(() => 'No response text');
+      console.log('API test response body:', responseText);
       throw new Error(`API test failed: ${testResponse.status} ${testResponse.statusText}`);
     }
 
-    console.log('Garmin authentication successful');
+    console.log('Garmin authentication successful! API access confirmed.');
     
-    // Return the cookies as the "auth header" - we'll use this for subsequent requests
-    return allCookies;
+    // Return the Bearer token for subsequent requests
+    return {
+      bearerToken: oauth2Data.access_token,
+      cookies: cookies,
+      expiresIn: oauth2Data.expires_in || 3600
+    };
     
   } catch (error) {
     console.error('Garmin authentication failed:', error);
@@ -568,7 +748,7 @@ async function authenticateGarmin(env) {
 /**
  * Fetch activities from Garmin Connect
  */
-async function fetchActivities(cookieHeader, lastSyncTime, isInitialSync) {
+async function fetchActivities(authData, lastSyncTime, isInitialSync) {
   const allActivities = [];
   let start = 0;
   let hasMore = true;
@@ -577,16 +757,13 @@ async function fetchActivities(cookieHeader, lastSyncTime, isInitialSync) {
   while (hasMore && allActivities.length < maxActivities) {
     const url = `${GARMIN_BASE_URL}/activitylist-service/activities/search/activities?limit=${PAGE_SIZE}&start=${start}`;
     
-    const response = await fetch(url, {
-      headers: {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': `${GARMIN_BASE_URL}/modern/activities`,
-        'Cookie': cookieHeader
-      }
-    });
+    const headers = {
+      'Accept': 'application/json',
+      'User-Agent': 'com.garmin.android.apps.connectmobile',
+      'Authorization': `Bearer ${authData.bearerToken}`
+    };
+    
+    const response = await fetch(url, { headers });
     
     if (!response.ok) {
       throw new Error(`Failed to fetch activities: ${response.statusText}`);
@@ -632,7 +809,7 @@ async function fetchActivities(cookieHeader, lastSyncTime, isInitialSync) {
 /**
  * Process and store activities in database
  */
-async function processAndStoreActivities(activities, authHeader, env) {
+async function processAndStoreActivities(activities, authData, env) {
   let processedCount = 0;
   
   for (const activity of activities) {
@@ -645,7 +822,7 @@ async function processAndStoreActivities(activities, authHeader, env) {
       
       // Enrich strength training activities with exercise sets
       if (activity.activityType?.typeKey === 'strength_training') {
-        activity.fullExerciseSets = await fetchActivityExerciseSets(activity.activityId, authHeader);
+        activity.fullExerciseSets = await fetchActivityExerciseSets(activity.activityId, authData);
       }
       
       // Process activity data
@@ -669,19 +846,17 @@ async function processAndStoreActivities(activities, authHeader, env) {
 /**
  * Fetch exercise sets for a strength training activity
  */
-async function fetchActivityExerciseSets(activityId, cookieHeader) {
+async function fetchActivityExerciseSets(activityId, authData) {
   try {
     const url = `${GARMIN_BASE_URL}/activity-service/activity/${activityId}/exerciseSets`;
-    const response = await fetch(url, {
-      headers: {
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Referer': `${GARMIN_BASE_URL}/modern/activity/${activityId}`,
-        'Cookie': cookieHeader
-      }
-    });
+    
+    const headers = {
+      'Accept': 'application/json',
+      'User-Agent': 'com.garmin.android.apps.connectmobile',
+      'Authorization': `Bearer ${authData.bearerToken}`
+    };
+
+    const response = await fetch(url, { headers });
     
     if (!response.ok) {
       console.warn(`Failed to fetch exercise sets for ${activityId}`);
@@ -842,6 +1017,63 @@ async function storeActivity(activity, env) {
       }
     }
   }
+}
+
+/**
+ * Generate OAuth1 nonce (random string)
+ */
+function generateNonce() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 32; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+/**
+ * Generate OAuth1 signature using HMAC-SHA1
+ */
+async function generateOAuth1Signature(method, url, params, consumerSecret, tokenSecret = '') {
+  // Create the base string
+  const sortedParams = Object.keys(params)
+    .sort()
+    .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`)
+    .join('&');
+  
+  const baseString = [
+    method.toUpperCase(),
+    encodeURIComponent(url),
+    encodeURIComponent(sortedParams)
+  ].join('&');
+  
+  // Create the signing key
+  const signingKey = `${encodeURIComponent(consumerSecret)}&${encodeURIComponent(tokenSecret)}`;
+  
+  // Generate HMAC-SHA1 signature
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(signingKey);
+  const messageData = encoder.encode(baseString);
+  
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+  
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, messageData);
+  
+  // Convert to base64 with proper padding
+  const bytes = new Uint8Array(signature);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  const base64Signature = btoa(binary);
+  
+  return base64Signature;
 }
 
 // Export for testing
