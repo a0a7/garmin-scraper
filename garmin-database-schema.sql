@@ -31,11 +31,12 @@ CREATE TABLE IF NOT EXISTS activities (
     total_sets INTEGER,
     
     -- GPS/Route data
-    gps_polyline TEXT,
+    gps_polyline TEXT, -- JSON array of GPS points: [{"lat":44.91, "lon":-93.50, "timestamp":1754531747000}, ...]
     start_latitude REAL,
     start_longitude REAL,
     end_latitude REAL,
     end_longitude REAL,
+    total_gps_points INTEGER, -- Number of GPS coordinates in the track
     has_gps_data BOOLEAN DEFAULT FALSE,
     
     -- Weather data
@@ -110,6 +111,9 @@ ALTER TABLE activities ADD COLUMN total_working_time INTEGER;
 ALTER TABLE activities ADD COLUMN total_rest_time INTEGER;
 ALTER TABLE activities ADD COLUMN work_to_rest_ratio REAL;
 ALTER TABLE activities ADD COLUMN work_percentage INTEGER;
+
+-- Add enhanced GPS column
+ALTER TABLE activities ADD COLUMN total_gps_points INTEGER;
 
 -- Add timing columns to exercise_sets
 ALTER TABLE exercise_sets ADD COLUMN total_working_time INTEGER;

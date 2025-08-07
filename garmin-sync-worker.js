@@ -37,6 +37,18 @@ async function handleScheduled(event, env) {
 async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   
+  // Handle CORS preflight requests
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400',
+      }
+    });
+  }
+  
   // Webhook endpoint for manual triggers - FAST RESPONSE (< 1 second)
   if (url.pathname === '/sync' && request.method === 'POST') {
     // Verify webhook signature if needed
@@ -108,6 +120,16 @@ async function handleRequest(request, env, ctx) {
   if (url.pathname === '/import-data' && request.method === 'POST') {
     return handleDataImport(request, env);
   }
+
+  // GPS backfill endpoints
+  if (url.pathname === '/activities-without-gps' && request.method === 'GET') {
+    return handleGetActivitiesWithoutGPS(request, env);
+  }
+
+  if (url.pathname === '/update-gps-data' && request.method === 'POST') {
+    return handleUpdateGPSData(request, env);
+  }
+
   if (url.pathname === '/status') {
     const lastSync = await getLastSyncTime(env);
     return new Response(JSON.stringify({
@@ -756,6 +778,7 @@ async function fetchActivities(authData, lastSyncTime, isInitialSync) {
   let start = 0;
   let hasMore = true;
   const maxActivities = isInitialSync ? 1500 : 100; // Limit for initial sync
+  const ALWAYS_UPDATE_COUNT = 8; // Always refresh the last 8 activities
   
   while (hasMore && allActivities.length < maxActivities) {
     const url = `${GARMIN_BASE_URL}/activitylist-service/activities/search/activities?limit=${PAGE_SIZE}&start=${start}`;
@@ -786,12 +809,42 @@ async function fetchActivities(authData, lastSyncTime, isInitialSync) {
         const activityDate = new Date(activity.startTimeLocal);
         return activityDate > new Date(lastSyncTime);
       });
+      
+      // Always include the first ALWAYS_UPDATE_COUNT activities (most recent) for potential updates
+      // even if they're older than lastSyncTime
+      if (start === 0) {
+        const recentActivities = activities.slice(0, ALWAYS_UPDATE_COUNT);
+        const newActivities = filteredActivities;
+        
+        // Combine recent activities (for updates) with new activities (new since last sync)
+        // Remove duplicates by activity ID
+        const combinedMap = new Map();
+        
+        // Add new activities first
+        newActivities.forEach(activity => {
+          combinedMap.set(activity.activityId, { ...activity, isNew: true });
+        });
+        
+        // Add recent activities, marking them as potentially needing updates
+        recentActivities.forEach(activity => {
+          if (!combinedMap.has(activity.activityId)) {
+            combinedMap.set(activity.activityId, { ...activity, isRecentUpdate: true });
+          } else {
+            // Mark as both new and recent (highest priority)
+            combinedMap.get(activity.activityId).isRecentUpdate = true;
+          }
+        });
+        
+        filteredActivities = Array.from(combinedMap.values());
+        console.log(`📅 Including ${recentActivities.length} recent activities for potential updates`);
+      }
     }
     
     allActivities.push(...filteredActivities);
     
     // If we got filtered results and they're from before our sync time, we can stop
-    if (filteredActivities.length < activities.length) {
+    // But continue until we've checked at least ALWAYS_UPDATE_COUNT activities
+    if (filteredActivities.length < activities.length && start >= ALWAYS_UPDATE_COUNT) {
       hasMore = false;
     }
     
@@ -806,6 +859,7 @@ async function fetchActivities(authData, lastSyncTime, isInitialSync) {
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   
+  console.log(`📊 Fetched ${allActivities.length} activities (including recent updates check)`);
   return allActivities;
 }
 
@@ -887,39 +941,62 @@ async function fetchActivityExerciseSets(activityId, authData) {
 }
 
 /**
- * Fetch GPS route data for an activity
+ * Fetch GPS route data for an activity using the polyline endpoint
  */
 async function fetchActivityRouteData(activityId, authData) {
   try {
-    const url = `${GARMIN_BASE_URL}/activity-service/activity/${activityId}`;
+    const url = `${GARMIN_BASE_URL}/activity-service/activity/${activityId}/polyline/full-resolution/?_=${Date.now()}`;
     
     const headers = {
-      'Accept': 'application/json',
-      'User-Agent': 'com.garmin.android.apps.connectmobile',
-      'Authorization': `Bearer ${authData.bearerToken}`
+      'accept': 'application/json, text/javascript, */*; q=0.01',
+      'accept-language': 'en-US,en;q=0.9',
+      'authorization': `Bearer ${authData.bearerToken}`,
+      'cache-control': 'no-cache',
+      'di-backend': 'connectapi.garmin.com',
+      'nk': 'NT',
+      'pragma': 'no-cache',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'same-origin',
+      'x-requested-with': 'XMLHttpRequest'
     };
 
     const response = await fetch(url, { headers });
     
     if (!response.ok) {
-      console.warn(`Failed to fetch route data for ${activityId}`);
+      console.warn(`Failed to fetch GPS data for ${activityId}: ${response.status}`);
       return { hasPolyline: false };
     }
     
     const data = await response.json();
     
-    if (data.geoPolylineDTO && data.geoPolylineDTO.polyline) {
-      return {
-        polyline: data.geoPolylineDTO.polyline,
-        startLatitude: data.geoPolylineDTO.startLatitude,
-        startLongitude: data.geoPolylineDTO.startLongitude,
-        endLatitude: data.geoPolylineDTO.endLatitude,
-        endLongitude: data.geoPolylineDTO.endLongitude,
-        hasPolyline: true
-      };
-    } else {
-      return { hasPolyline: false };
+    // Process the polyline data from the new endpoint
+    if (data.polyline && Array.isArray(data.polyline) && data.polyline.length > 0) {
+      // Convert polyline format: [timestamp, lat, lon] to {lat, lon, timestamp}
+      const gpsPoints = data.polyline.map(point => ({
+        timestamp: point[0], // Unix timestamp
+        lat: point[1],       // Latitude
+        lon: point[2]        // Longitude
+      }));
+      
+      if (gpsPoints.length > 0) {
+        return {
+          gpsPoints: gpsPoints,
+          startLatitude: gpsPoints[0].lat,
+          startLongitude: gpsPoints[0].lon,
+          endLatitude: gpsPoints[gpsPoints.length - 1].lat,
+          endLongitude: gpsPoints[gpsPoints.length - 1].lon,
+          minLatitude: data.minLat,
+          maxLatitude: data.maxLat,
+          minLongitude: data.minLon,
+          maxLongitude: data.maxLon,
+          hasPolyline: true,
+          totalGpsPoints: gpsPoints.length
+        };
+      }
     }
+    
+    return { hasPolyline: false };
     
   } catch (error) {
     console.error(`Error fetching route data for ${activityId}:`, error);
@@ -1109,8 +1186,15 @@ async function getActivityById(activityId, env) {
 }
 
 async function shouldUpdateActivity(existing, newActivity) {
-  // Determine if activity should be updated (e.g., if it was modified)
-  return false; // For now, don't update existing activities
+  // Always update if this is marked as a recent activity that should be refreshed
+  if (newActivity.isRecentUpdate) {
+    console.log(`🔄 Updating recent activity: ${newActivity.activityName || 'Unknown'} (${newActivity.activityId})`);
+    return true;
+  }
+  
+  // For other activities, don't update existing ones
+  // In the future, we could check if certain fields have changed
+  return false;
 }
 
 async function storeActivity(activity, env) {
@@ -1122,18 +1206,36 @@ async function storeActivity(activity, env) {
      elevation_gain, elevation_loss, average_power, max_power,
      normalized_power, training_stress_score, average_cadence, max_cadence,
      total_reps, total_sets, 
-     gps_polyline, start_latitude, start_longitude, end_latitude, end_longitude, has_gps_data,
+     gps_polyline, start_latitude, start_longitude, end_latitude, end_longitude, 
+     total_gps_points, has_gps_data,
      temperature, apparent_temperature, humidity, dew_point, wind_speed, wind_direction,
      wind_direction_compass, wind_gust, weather_description, weather_station, 
      weather_issue_date, has_weather_data,
      total_working_time, total_rest_time, work_to_rest_ratio, work_percentage,
      created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
-            ?, ?, ?, ?, ?, ?, 
+            ?, ?, ?, ?, ?, ?, ?, 
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?)
   `;
+  
+  // Prepare GPS data for storage
+  let gpsPolyline = null;
+  let totalGpsPoints = 0;
+  
+  if (activity.gpsData?.gpsPoints && activity.gpsData.gpsPoints.length > 0) {
+    // Store GPS points as JSON string
+    gpsPolyline = JSON.stringify(activity.gpsData.gpsPoints);
+    totalGpsPoints = activity.gpsData.gpsPoints.length;
+  } else if (activity.gpsData?.polyline) {
+    // Store existing polyline format
+    gpsPolyline = JSON.stringify(activity.gpsData.polyline);
+    totalGpsPoints = Array.isArray(activity.gpsData.polyline) ? activity.gpsData.polyline.length : 0;
+  } else if (activity.gpsData?.totalGpsPoints) {
+    // Use provided total if available
+    totalGpsPoints = activity.gpsData.totalGpsPoints;
+  }
   
   await env.DATABASE.prepare(activityQuery).bind(
     activity.id, activity.name, activity.type, activity.startTime,
@@ -1144,12 +1246,13 @@ async function storeActivity(activity, env) {
     activity.normalizedPower, activity.trainingStressScore,
     activity.averageCadence, activity.maxCadence, activity.totalReps,
     activity.totalSets, 
-    // GPS data
-    activity.gpsData?.polyline || null,
+    // GPS data - store GPS points as JSON or existing polyline
+    gpsPolyline,
     activity.gpsData?.startLatitude || null,
     activity.gpsData?.startLongitude || null,
     activity.gpsData?.endLatitude || null,
     activity.gpsData?.endLongitude || null,
+    totalGpsPoints,
     activity.gpsData?.hasPolyline || false,
     // Weather data
     activity.weatherData?.temperature || null,
@@ -1321,6 +1424,161 @@ async function handleDataImport(request, env) {
     }), { 
       status: 500,
       headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+/**
+ * Handle request to get activities without GPS data
+ */
+async function handleGetActivitiesWithoutGPS(request, env) {
+  try {
+    console.log('📋 Fetching activities without GPS data...');
+
+    // Query activities that don't have GPS data or have has_gps_data = false
+    const query = `
+      SELECT id, name, type, start_time, has_gps_data 
+      FROM ${ACTIVITIES_TABLE} 
+      WHERE has_gps_data = false OR has_gps_data IS NULL
+      ORDER BY start_time DESC
+      LIMIT 1000
+    `;
+
+    const result = await env.DATABASE.prepare(query).all();
+    const activities = result.results || [];
+
+    console.log(`📊 Found ${activities.length} activities without GPS data`);
+
+    return new Response(JSON.stringify(activities), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET',
+        'Access-Control-Allow-Headers': 'Content-Type'
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching activities without GPS:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), { 
+      status: 500,
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Handle request to update GPS data for activities
+ */
+async function handleUpdateGPSData(request, env) {
+  try {
+    const body = await request.json();
+    const activities = body.activities || [];
+
+    if (!Array.isArray(activities) || activities.length === 0) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'No activities provided'
+      }), { 
+        status: 400,
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    console.log(`📥 Updating GPS data for ${activities.length} activities...`);
+
+    let updated = 0;
+    let errors = 0;
+
+    for (const activity of activities) {
+      try {
+        const { activityId, gpsData } = activity;
+
+        // Prepare GPS data for storage
+        let gpsPolyline = null;
+        let totalGpsPoints = 0;
+        
+        if (gpsData.gpsPoints && gpsData.gpsPoints.length > 0) {
+          gpsPolyline = JSON.stringify(gpsData.gpsPoints);
+          totalGpsPoints = gpsData.gpsPoints.length;
+        } else if (gpsData.polyline) {
+          gpsPolyline = JSON.stringify(gpsData.polyline);
+          totalGpsPoints = Array.isArray(gpsData.polyline) ? gpsData.polyline.length : 0;
+        } else if (gpsData.totalGpsPoints) {
+          totalGpsPoints = gpsData.totalGpsPoints;
+        }
+
+        // Update the activity with GPS data
+        const updateQuery = `
+          UPDATE ${ACTIVITIES_TABLE} 
+          SET gps_polyline = ?,
+              start_latitude = ?,
+              start_longitude = ?,
+              end_latitude = ?,
+              end_longitude = ?,
+              total_gps_points = ?,
+              has_gps_data = ?,
+              updated_at = ?
+          WHERE id = ?
+        `;
+
+        await env.DATABASE.prepare(updateQuery).bind(
+          gpsPolyline,
+          gpsData.startLatitude,
+          gpsData.startLongitude,
+          gpsData.endLatitude,
+          gpsData.endLongitude,
+          totalGpsPoints,
+          gpsData.hasPolyline,
+          new Date().toISOString(),
+          activityId
+        ).run();
+
+        updated++;
+        console.log(`✅ Updated GPS data for activity ${activityId}`);
+
+      } catch (error) {
+        console.error(`❌ Error updating GPS data for activity ${activity.activityId}:`, error);
+        errors++;
+      }
+    }
+
+    console.log(`🎉 GPS update completed: ${updated} updated, ${errors} errors`);
+
+    return new Response(JSON.stringify({
+      success: true,
+      updated: updated,
+      errors: errors,
+      message: `Updated GPS data for ${updated} activities${errors > 0 ? ` (${errors} errors)` : ''}`
+    }), {
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST',
+        'Access-Control-Allow-Headers': 'Content-Type'
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error handling GPS update request:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), { 
+      status: 500,
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
     });
   }
 }
