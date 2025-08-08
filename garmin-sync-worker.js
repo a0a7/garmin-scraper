@@ -53,16 +53,9 @@ async function handleRequest(request, env, ctx) {
   }
   
   // Webhook endpoint for manual triggers - FAST RESPONSE (< 1 second)
-  if (url.pathname === '/sync' && request.method === 'POST') {
-    // Verify webhook signature if needed
-    const signature = request.headers.get('X-Webhook-Signature');
-    if (!verifyWebhookSignature(request, signature, env)) {
-      return new Response('Unauthorized', { status: 401 });
-    }
-    
+  if (url.pathname === '/sync' && request.method === 'GET') {    
     console.log('Webhook received - triggering background sync...');
     
-    // Start sync in background without waiting (follows Ride with GPS guideline)
     ctx.waitUntil(syncGarminData(env).catch(error => {
       console.error('Background sync failed:', error);
     }));
