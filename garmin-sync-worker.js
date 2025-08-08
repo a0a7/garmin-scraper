@@ -53,9 +53,16 @@ async function handleRequest(request, env, ctx) {
   }
   
   // Webhook endpoint for manual triggers - FAST RESPONSE (< 1 second)
-  if (url.pathname === '/sync' && request.method === 'GET') {    
+  if (url.pathname === '/sync' && request.method === 'POST') {
+    // Verify webhook signature if needed
+    const signature = request.headers.get('X-Webhook-Signature');
+    if (!verifyWebhookSignature(request, signature, env)) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    
     console.log('Webhook received - triggering background sync...');
     
+    // Start sync in background without waiting (follows Ride with GPS guideline)
     ctx.waitUntil(syncGarminData(env).catch(error => {
       console.error('Background sync failed:', error);
     }));
@@ -73,6 +80,11 @@ async function handleRequest(request, env, ctx) {
 
   // Ride with GPS webhook endpoint
   if (url.pathname === '/ridewithgps-webhook' && request.method === 'POST') {
+    const signature = request.headers.get('X-RideWithGPS-Signature');
+    if (!verifyRideWithGPSSignature(request, signature, env)) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
     console.log('Ride with GPS webhook received - processing in background...');
     
     // Process webhook data in background
@@ -279,7 +291,10 @@ async function processRideWithGPSWebhook(request, env) {
     const webhookData = await request.json();
     console.log('Processing Ride with GPS webhook:', webhookData);
     
-    await syncGarminData(env);
+    // Process the webhook data (e.g., trigger sync when new activity is uploaded)
+    if (webhookData.type === 'activity_created' || webhookData.type === 'activity_updated') {
+      await syncGarminData(env);
+    }
     
     return true;
   } catch (error) {
@@ -564,7 +579,7 @@ async function syncGarminData(env) {
 
       // Refresh activity statistics cache
       await refreshActivityStats(env);
-
+      await refreshStrengthActivitiesCache(env);
       return {
         success: true,
         activitiesProcessed: processedCount,
