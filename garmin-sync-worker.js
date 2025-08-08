@@ -80,11 +80,6 @@ async function handleRequest(request, env, ctx) {
 
   // Ride with GPS webhook endpoint
   if (url.pathname === '/ridewithgps-webhook' && request.method === 'POST') {
-    const signature = request.headers.get('X-RideWithGPS-Signature');
-    if (!verifyRideWithGPSSignature(request, signature, env)) {
-      return new Response('Unauthorized', { status: 401 });
-    }
-
     console.log('Ride with GPS webhook received - processing in background...');
     
     // Process webhook data in background
@@ -291,10 +286,7 @@ async function processRideWithGPSWebhook(request, env) {
     const webhookData = await request.json();
     console.log('Processing Ride with GPS webhook:', webhookData);
     
-    // Process the webhook data (e.g., trigger sync when new activity is uploaded)
-    if (webhookData.type === 'activity_created' || webhookData.type === 'activity_updated') {
-      await syncGarminData(env);
-    }
+    await syncGarminData(env);
     
     return true;
   } catch (error) {
