@@ -68,7 +68,10 @@ async function handleRequest(request, env, ctx) {
       timestamp: new Date().toISOString()
     }), {
       status: 200,
-      headers: { 'Content-Type': 'application/json' }
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
     });
   }
 
