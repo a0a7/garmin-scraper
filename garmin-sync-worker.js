@@ -15,27 +15,8 @@ const EXERCISE_SETS_TABLE = 'exercise_sets';
 // Activity types that typically have outdoor GPS/weather data
 const OUTDOOR_ACTIVITIES = ['running', 'cycling', 'walking', 'hiking', 'mountain_biking', 'road_biking', 'trail_running'];
 
-// ES Module exports for scheduled and fetch events
-export default {
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(handleScheduled(event, env));
-  },
 
-  async fetch(request, env, ctx) {
-    return handleRequest(request, env, ctx);
-  }
-};
-
-/**
- * Handle scheduled execution (daily sync)
- */
-async function handleScheduled(event, env) {
-  console.log('Running scheduled Garmin sync...');
-  return await syncGarminData(env);
-
-/**
- * Handle HTTP requests (webhook endpoint)
- */
+// Move handleRequest above export default so it is defined before use
 async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
 
@@ -188,6 +169,25 @@ async function handleRequest(request, env, ctx) {
   }
   
   return new Response('Not Found', { status: 404 });
+}
+
+// ES Module exports for scheduled and fetch events
+export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(handleScheduled(event, env));
+  },
+
+  async fetch(request, env, ctx) {
+    return handleRequest(request, env, ctx);
+  }
+};
+
+/**
+ * Handle scheduled execution (daily sync)
+ */
+async function handleScheduled(event, env) {
+  console.log('Running scheduled Garmin sync...');
+  return await syncGarminData(env);
 }
 // Move function definitions above their first use to avoid ReferenceError
 async function handleGetActivityStatsSummary(request, env) {
