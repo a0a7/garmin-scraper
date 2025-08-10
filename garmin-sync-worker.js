@@ -15,22 +15,57 @@ const EXERCISE_SETS_TABLE = 'exercise_sets';
 // Activity types that typically have outdoor GPS/weather data
 const OUTDOOR_ACTIVITIES = ['running', 'cycling', 'walking', 'hiking', 'mountain_biking', 'road_biking', 'trail_running'];
 
+// Polyline encoder (ESM import)
+import polyline from '@mapbox/polyline';
 
-// Move handleRequest above export default so it is defined before use
+// ES Module exports for scheduled and fetch events
+export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(handleScheduled(event, env));
+  },
+
+  async fetch(request, env, ctx) {
+    return handleRequest(request, env, ctx);
+  }
+};
+
+// --- DATABASE MIGRATION: Create gps_polylines table if not exists ---
+async function ensureGPSPolylinesTable(env) {
+  const createTableSQL = `
+    CREATE TABLE IF NOT EXISTS gps_polylines (
+      activity_id INTEGER PRIMARY KEY,
+      polyline TEXT NOT NULL
+    );
+  `;
+  await env.DATABASE.exec(createTableSQL);
+}
+
+// Call this at startup (first request)
+let gpsPolylinesTableChecked = false;
+async function ensureTables(env) {
+  if (!gpsPolylinesTableChecked) {
+    gpsPolylinesTableChecked = true;
+  }
+}
+
+/**
+ * Handle scheduled execution (daily sync)
+ */
+async function handleScheduled(event, env) {
+  console.log('Running scheduled Garmin sync...');
+  return await syncGarminData(env);
+}
+
+/**
+ * Handle HTTP requests (webhook endpoint)
+ */
 async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
 
-  // Endpoint: 10 most recent activities
-  if (url.pathname === '/recent-activities' && request.method === 'GET') {
-    return handleGetRecentActivities(request, env);
-  }
-
-  // Endpoint: stats for past week, 2 weeks, 4 weeks, year
   if (url.pathname === '/activity-stats' && request.method === 'GET') {
     return await handleGetActivityStatsSummary(request, env);
   }
 
-  // GPS activities endpoint with caching
   if (url.pathname === '/gps-activities' && request.method === 'GET') {
     return handleGetGPSActivities(request, env);
   }
@@ -122,7 +157,10 @@ async function handleRequest(request, env, ctx) {
   }
 
   if (url.pathname === '/update-gps-data' && request.method === 'POST') {
-    return handleUpdateGPSData(request, env);
+    // Support batching: accept ?start=0&limit=10
+    const start = parseInt(url.searchParams.get('start') || '0', 10);
+    const limit = parseInt(url.searchParams.get('limit') || '10', 10);
+    return handleUpdateGPSData(request, env, start, limit);
   }
 
   // Upload all activities endpoint (GPS and non-GPS)
@@ -170,26 +208,6 @@ async function handleRequest(request, env, ctx) {
   
   return new Response('Not Found', { status: 404 });
 }
-
-// ES Module exports for scheduled and fetch events
-export default {
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(handleScheduled(event, env));
-  },
-
-  async fetch(request, env, ctx) {
-    return handleRequest(request, env, ctx);
-  }
-};
-
-/**
- * Handle scheduled execution (daily sync)
- */
-async function handleScheduled(event, env) {
-  console.log('Running scheduled Garmin sync...');
-  return await syncGarminData(env);
-}
-// Move function definitions above their first use to avoid ReferenceError
 async function handleGetActivityStatsSummary(request, env) {
   try {
     const now = new Date();
@@ -219,9 +237,10 @@ async function handleGetActivityStatsSummary(request, env) {
     for (const win of windows) {
       // Activities in window
       const activitiesQuery = `
-        SELECT id, type, duration, distance, total_sets, total_reps
+        SELECT id, type, duration, distance, total_sets, total_reps, start_time, name
         FROM activities
         WHERE start_time >= ?
+        ORDER BY start_time DESC
       `;
       const activities = (await env.DATABASE.prepare(activitiesQuery).bind(win.since).all()).results;
 
@@ -246,13 +265,17 @@ async function handleGetActivityStatsSummary(request, env) {
         }
       }
 
+      // Get the 10 most recent activities for this window
+      const recentActivities = activities.slice(0, 10);
+
       stats[win.label] = {
         activityCount,
         totalTime,
         totalDistance,
         totalSets,
         totalReps,
-        totalVolume
+        totalVolume,
+        recentActivities
       };
     }
 
@@ -281,261 +304,7 @@ async function handleGetActivityStatsSummary(request, env) {
   }
 }
 
-
-/**
- * Handle GET /recent-activities endpoint
- * Returns the 10 most recent activities
- */
-async function handleGetRecentActivities(request, env) {
-  try {
-    const activitiesQuery = `
-      SELECT * FROM activities
-      ORDER BY start_time DESC
-      LIMIT 10
-    `;
-    const activities = (await env.DATABASE.prepare(activitiesQuery).all()).results;
-    return new Response(JSON.stringify({
-      success: true,
-      activities
-    }), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=600'
-      }
-    });
-  } catch (error) {
-    console.error('❌ Error getting recent activities:', error);
-    return new Response(JSON.stringify({
-      success: false,
-      error: error.message
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
-}
-
-// ...existing code...
-
-/**
- * Handle GET /activity-stats endpoint
- * Returns stats for the past week, 2 weeks, 4 weeks, and year
- */
-async function handleGetGPSActivities(request, env) {
-  try {
-    // Try to get cached data first
-    let cached = await env.GARMIN_SYNC_KV.get('gps_activities_cache', { type: 'json' });
-    if (cached) {
-      return new Response(JSON.stringify({
-        success: true,
-        activities: cached.activities,
-        lastUpdated: cached.lastUpdated,
-        cached: true
-      }), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 'public, max-age=3600'
-        }
-      });
-    }
-    // If not cached, generate and cache
-    const data = await generateGPSActivities(env);
-    await env.GARMIN_SYNC_KV.put('gps_activities_cache', JSON.stringify(data));
-    return new Response(JSON.stringify({
-      success: true,
-      activities: data.activities,
-      lastUpdated: data.lastUpdated,
-      cached: false
-    }), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=3600'
-      }
-    });
-  } catch (error) {
-    console.error('❌ Error getting GPS activities:', error);
-    return new Response(JSON.stringify({
-      success: false,
-      error: error.message
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
-}
-
-async function handleGetActivityStatsSummary(request, env) {
-  try {
-    const now = new Date();
-    // Helper to get ISO string for N days ago
-    const daysAgo = (n) => {
-      const d = new Date(now);
-      d.setDate(d.getDate() - n);
-      return d.toISOString();
-    };
-    // Helper to get ISO string for N years ago
-    const yearsAgo = (n) => {
-      const d = new Date(now);
-      d.setFullYear(d.getFullYear() - n);
-      return d.toISOString();
-    };
-
-    // Time windows
-    const windows = [
-      { label: 'week', since: daysAgo(7) },
-      { label: 'two_weeks', since: daysAgo(14) },
-      { label: 'four_weeks', since: daysAgo(28) },
-      { label: 'year', since: yearsAgo(1) }
-    ];
-
-    // For each window, get stats
-    const stats = {};
-    for (const win of windows) {
-      // Activities in window
-      const activitiesQuery = `
-        SELECT id, type, duration, distance, total_sets, total_reps
-        FROM activities
-        WHERE start_time >= ?
-      `;
-      const activities = (await env.DATABASE.prepare(activitiesQuery).bind(win.since).all()).results;
-
-      // Aggregate stats
-      let activityCount = activities.length;
-      let totalTime = 0;
-      let totalDistance = 0;
-      let totalSets = 0;
-      let totalReps = 0;
-      let totalVolume = 0;
-
-      for (const act of activities) {
-        totalTime += act.duration || 0;
-        totalDistance += act.distance || 0;
-        totalSets += act.total_sets || 0;
-        totalReps += act.total_reps || 0;
-        // For volume, sum from exercise_sets table if strength
-        if (act.type === 'strength_training' || act.type === 'strength') {
-          const setsQuery = `SELECT SUM(total_volume) as volume FROM exercise_sets WHERE activity_id = ?`;
-          const res = await env.DATABASE.prepare(setsQuery).bind(act.id).first();
-          totalVolume += res?.volume || 0;
-        }
-      }
-
-      stats[win.label] = {
-        activityCount,
-        totalTime,
-        totalDistance,
-        totalSets,
-        totalReps,
-        totalVolume
-      };
-    }
-
-    return new Response(JSON.stringify({
-      success: true,
-      stats
-    }), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=600'
-      }
-    });
-  } catch (error) {
-    console.error('❌ Error getting activity stats summary:', error);
-    return new Response(JSON.stringify({
-      success: false,
-      error: error.message
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
-}
-/**
- * Handle GET /gps-activities endpoint
- * Returns all activities with GPS data (distance > 0), including their GPS points if available
- * Caches the result for efficiency
- */
-async function handleGetGPSActivities(request, env) {
-  try {
-    // Try to get cached data first
-    let cached = await env.GARMIN_SYNC_KV.get('gps_activities_cache', { type: 'json' });
-    if (cached) {
-      return new Response(JSON.stringify({
-        success: true,
-        activities: cached.activities,
-        lastUpdated: cached.lastUpdated,
-        cached: true
-      }), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 'public, max-age=3600'
-        }
-      });
-    }
-    // If not cached, generate and cache
-    const data = await generateGPSActivities(env);
-    await env.GARMIN_SYNC_KV.put('gps_activities_cache', JSON.stringify(data));
-    return new Response(JSON.stringify({
-      success: true,
-      activities: data.activities,
-      lastUpdated: data.lastUpdated,
-      cached: false
-    }), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=3600'
-      }
-    });
-  } catch (error) {
-    console.error('❌ Error getting GPS activities:', error);
-    return new Response(JSON.stringify({
-      success: false,
-      error: error.message
-    }), {
-      status: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
-}
-
-/**
- * Generate all activities with GPS data (distance > 0)
- * Includes their GPS points if available
- */
-async function generateGPSActivities(env) {
-  // Get all activities with distance > 0
-  const activitiesQuery = `
-    SELECT * FROM activities
-    WHERE distance IS NOT NULL AND distance > 0
-    ORDER BY start_time DESC
-  `;
-  const activities = (await env.DATABASE.prepare(activitiesQuery).all()).results;
-  // For each activity, try to get GPS data if available (if stored in a gpsData/gps_points column, or skip if not present)
-  // If you store GPS points in a separate table, you can join here. For now, just return the activity as-is.
-  // If you want to include GPS points, add logic here to fetch them per activity.
-  return {
-    lastUpdated: new Date().toISOString(),
-    activities
-  };
-}
+async function handleGetStrengthActivities(request, env) {
   try {
     // Try to get cached data first
     let cached = await env.GARMIN_SYNC_KV.get('strength_activities_cache', { type: 'json' });
@@ -583,6 +352,93 @@ async function generateGPSActivities(env) {
   }
 }
 
+async function handleGetGPSActivities(request, env) {
+  try {
+    await ensureTables(env);
+    // Try to get cached data first
+    let cached = await env.GARMIN_SYNC_KV.get('gps_activities_cache', { type: 'json' });
+    if (cached) {
+      return new Response(JSON.stringify({
+        success: true,
+        activities: cached.activities,
+        lastUpdated: cached.lastUpdated,
+        cached: true
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=3600'
+        }
+      });
+    }
+    // If not cached, generate and cache
+    const data = await generateGPSActivities(env);
+    // await env.GARMIN_SYNC_KV.put('gps_activities_cache', JSON.stringify(data));
+    return new Response(JSON.stringify({
+      success: true,
+      activities: data.activities,
+      lastUpdated: data.lastUpdated,
+      cached: false
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting GPS activities:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+/**
+ * Generate all activities with GPS data (distance > 0)
+ * Includes their GPS points if available
+ */
+// Generate all activities with GPS data, including encoded polylines
+async function generateGPSActivities(env) {
+  await ensureTables(env);
+  // Get all activities with distance > 0
+  const activitiesQuery = `
+    SELECT id, type, duration, distance, start_time, name
+    FROM activities
+    WHERE distance IS NOT NULL AND distance > 0
+    ORDER BY start_time DESC
+  `;
+  const activities = (await env.DATABASE.prepare(activitiesQuery).all()).results;
+  // For each activity, get encoded polyline if available
+  const polylineQuery = `SELECT polyline FROM gps_polylines WHERE activity_id = ?`;
+  for (const activity of activities) {
+    const polylineRow = await env.DATABASE.prepare(polylineQuery).bind(activity.id).first();
+    activity.encodedPolyline = polylineRow ? polylineRow.polyline : null;
+  }
+  return {
+    lastUpdated: new Date().toISOString(),
+    activities
+  };
+}
+
+// Store encoded polyline for an activity
+async function storeEncodedPolyline(activityId, points, env) {
+  if (!Array.isArray(points) || points.length === 0) return;
+  const encoded = polyline.encode(points);
+  await ensureTables(env);
+  const upsertSQL = `
+    INSERT INTO gps_polylines (activity_id, polyline)
+    VALUES (?, ?)
+    ON CONFLICT(activity_id) DO UPDATE SET polyline=excluded.polyline;
+  `;
+  await env.DATABASE.prepare(upsertSQL).bind(activityId, encoded).run();
+}
 /**
  * Generate all strength activities with their set data
  */
@@ -1476,32 +1332,38 @@ async function processAndStoreActivities(activities, authData, env) {
       if (existing && !shouldUpdateActivity(existing, activity)) {
         continue;
       }
-      
+
       // Enrich strength training activities with exercise sets
       if (activity.activityType?.typeKey === 'strength_training') {
         activity.fullExerciseSets = await fetchActivityExerciseSets(activity.activityId, authData);
       }
-      
+
       // Enrich GPS activities with route data
       if (activity.distance && activity.distance > 0 && ['running', 'cycling', 'walking', 'hiking', 'mountain_biking'].includes(activity.activityType?.typeKey)) {
         activity.gpsData = await fetchActivityRouteData(activity.activityId, authData);
+        // If gpsData contains gpsPoints, encode and store polyline
+        if (activity.gpsData && Array.isArray(activity.gpsData.gpsPoints) && activity.gpsData.gpsPoints.length > 0) {
+          // Convert to [lat, lon] pairs for polyline encoding
+          const latlngs = activity.gpsData.gpsPoints.map(pt => [pt.lat, pt.lon]);
+          await storeEncodedPolyline(activity.activityId, latlngs, env);
+        }
       }
-      
+
       // Enrich outdoor activities with weather data
       if (OUTDOOR_ACTIVITIES.includes(activity.activityType?.typeKey)) {
         activity.weatherData = await fetchActivityWeatherData(activity.activityId, authData);
       }
-      
+
       // Process activity data
       const processedActivity = processActivityData(activity);
-      
+
       // Store in database
       await storeActivity(processedActivity, env);
       processedCount++;
-      
+
       // Rate limiting
       await new Promise(resolve => setTimeout(resolve, 50));
-      
+
     } catch (error) {
       console.error(`Failed to process activity ${activity.activityId}:`, error);
     }
@@ -1570,6 +1432,11 @@ async function processAndStoreActivitiesWithLimits(activities, authData, env, ma
         console.log(`🗺️ Fetching GPS data for activity ${activity.activityId}`);
         activity.gpsData = await fetchActivityRouteData(activity.activityId, authData);
         subrequestCount += 1;
+        // If gpsData contains gpsPoints, encode and store polyline
+        if (activity.gpsData && Array.isArray(activity.gpsData.gpsPoints) && activity.gpsData.gpsPoints.length > 0) {
+          const latlngs = activity.gpsData.gpsPoints.map(pt => [pt.lat, pt.lon]);
+          await storeEncodedPolyline(activity.activityId, latlngs, env);
+        }
       }
       
       // Enrich outdoor activities with weather data
@@ -2238,111 +2105,52 @@ async function handleGetActivitiesWithoutGPS(request, env) {
 /**
  * Handle request to update GPS data for activities
  */
-async function handleUpdateGPSData(request, env) {
-  try {
-    const body = await request.json();
-    const activities = body.activities || [];
-
-    if (!Array.isArray(activities) || activities.length === 0) {
-      return new Response(JSON.stringify({
-        success: false,
-        error: 'No activities provided'
-      }), { 
-        status: 400,
-        headers: { 
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    }
-
-    console.log(`📥 Updating GPS data for ${activities.length} activities...`);
-
-    let updated = 0;
-    let errors = 0;
-
-    for (const activity of activities) {
-      try {
-        const { activityId, gpsData } = activity;
-
-        // Prepare GPS data for storage
-        let gpsPolyline = null;
-        let totalGpsPoints = 0;
-        
-        if (gpsData.gpsPoints && gpsData.gpsPoints.length > 0) {
-          gpsPolyline = JSON.stringify(gpsData.gpsPoints);
-          totalGpsPoints = gpsData.gpsPoints.length;
-        } else if (gpsData.polyline) {
-          gpsPolyline = JSON.stringify(gpsData.polyline);
-          totalGpsPoints = Array.isArray(gpsData.polyline) ? gpsData.polyline.length : 0;
-        } else if (gpsData.totalGpsPoints) {
-          totalGpsPoints = gpsData.totalGpsPoints;
-        }
-
-        // Update the activity with GPS data
-        const updateQuery = `
-          UPDATE ${ACTIVITIES_TABLE} 
-          SET gps_polyline = ?,
-              start_latitude = ?,
-              start_longitude = ?,
-              end_latitude = ?,
-              end_longitude = ?,
-              total_gps_points = ?,
-              has_gps_data = ?,
-              updated_at = ?
-          WHERE id = ?
-        `;
-
-        await env.DATABASE.prepare(updateQuery).bind(
-          gpsPolyline,
-          gpsData.startLatitude,
-          gpsData.startLongitude,
-          gpsData.endLatitude,
-          gpsData.endLongitude,
-          totalGpsPoints,
-          gpsData.hasPolyline,
-          new Date().toISOString(),
-          activityId
-        ).run();
-
+// Polyline backfill batching implementation
+async function handleUpdateGPSData(request, env, start = 0, limit = 10) {
+  await ensureTables(env);
+  // Find activities with distance > 0 and no polyline, paginated
+  const query = `
+    SELECT a.id
+    FROM activities a
+    LEFT JOIN gps_polylines g ON a.id = g.activity_id
+    WHERE a.distance IS NOT NULL AND a.distance > 0 AND g.activity_id IS NULL
+    ORDER BY a.start_time DESC
+    LIMIT ? OFFSET ?
+  `;
+  const activities = (await env.DATABASE.prepare(query).bind(limit, start).all()).results;
+  let updated = 0;
+  for (const act of activities) {
+    try {
+      // Use default authentication (e.g., service credentials in env)
+      // This allows browser-based batch backfill without Authorization header
+      const authData = await authenticateGarmin(env);
+      if (!authData) continue;
+      const gpsData = await fetchActivityRouteData(act.id, authData);
+      if (gpsData && Array.isArray(gpsData.gpsPoints) && gpsData.gpsPoints.length > 0) {
+        await storeEncodedPolyline(act.id, gpsData.gpsPoints, env);
         updated++;
-        console.log(`✅ Updated GPS data for activity ${activityId}`);
-
-      } catch (error) {
-        console.error(`❌ Error updating GPS data for activity ${activity.activityId}:`, error);
-        errors++;
       }
+    } catch (err) {
+      // Log and skip
+      console.error('Error backfilling polyline for activity', act.id, err);
     }
-
-    console.log(`🎉 GPS update completed: ${updated} updated, ${errors} errors`);
-
-    return new Response(JSON.stringify({
-      success: true,
-      updated: updated,
-      errors: errors,
-      message: `Updated GPS data for ${updated} activities${errors > 0 ? ` (${errors} errors)` : ''}`
-    }), {
-      headers: { 
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'POST',
-        'Access-Control-Allow-Headers': 'Content-Type'
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Error handling GPS update request:', error);
-    return new Response(JSON.stringify({
-      success: false,
-      error: error.message
-    }), { 
-      status: 500,
-      headers: { 
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
   }
+  // Check if more remain
+  const countQuery = `
+    SELECT COUNT(*) as count
+    FROM activities a
+    LEFT JOIN gps_polylines g ON a.id = g.activity_id
+    WHERE a.distance IS NOT NULL AND a.distance > 0 AND g.activity_id IS NULL
+  `;
+  const remain = (await env.DATABASE.prepare(countQuery).first()).count;
+  return new Response(JSON.stringify({
+    success: true,
+    updated,
+    nextStart: remain > 0 ? start + limit : null,
+    remain
+  }), {
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+  });
 }
 
 /**
@@ -2719,13 +2527,3 @@ async function refreshActivityStats(env) {
     throw error;
   }
 }
-
-// Export for testing
-export {
-  handleRequest,
-  handleScheduled,
-  syncGarminData,
-  authenticateGarmin,
-  fetchActivities,
-  processActivityData
-};
