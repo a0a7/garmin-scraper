@@ -38,6 +38,8 @@ async function handleScheduled(event, env) {
  * Handle HTTP requests (webhook endpoint)
  */
 async function handleRequest(request, env, ctx) {
+  const url = new URL(request.url);
+
   // Endpoint: 10 most recent activities
   if (url.pathname === '/recent-activities' && request.method === 'GET') {
     return handleGetRecentActivities(request, env);
@@ -47,11 +49,11 @@ async function handleRequest(request, env, ctx) {
   if (url.pathname === '/activity-stats' && request.method === 'GET') {
     return handleGetActivityStatsSummary(request, env);
   }
+
   // GPS activities endpoint with caching
   if (url.pathname === '/gps-activities' && request.method === 'GET') {
     return handleGetGPSActivities(request, env);
   }
-  const url = new URL(request.url);
   
   // Handle CORS preflight requests
   if (request.method === 'OPTIONS') {
