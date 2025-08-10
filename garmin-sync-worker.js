@@ -15,7 +15,6 @@ const EXERCISE_SETS_TABLE = 'exercise_sets';
 // Activity types that typically have outdoor GPS/weather data
 const OUTDOOR_ACTIVITIES = ['running', 'cycling', 'walking', 'hiking', 'mountain_biking', 'road_biking', 'trail_running'];
 
-// Polyline encoder (ESM import)
 import polyline from '@mapbox/polyline';
 
 // ES Module exports for scheduled and fetch events
@@ -41,7 +40,7 @@ async function ensureGPSPolylinesTable(env) {
 }
 
 // Call this at startup (first request)
-let gpsPolylinesTableChecked = false;
+let gpsPolylinesTableChecked = true;
 async function ensureTables(env) {
   if (!gpsPolylinesTableChecked) {
     gpsPolylinesTableChecked = true;
@@ -160,8 +159,69 @@ async function handleRequest(request, env, ctx) {
     // Support batching: accept ?start=0&limit=10
     const start = parseInt(url.searchParams.get('start') || '0', 10);
     const limit = parseInt(url.searchParams.get('limit') || '10', 10);
-    return handleUpdateGPSData(request, env, start, limit);
+    return handleUpdateGPSDataFromLocal(request, env, start, limit);
   }
+// New: Fill in polylines from local GPS data in activities table
+async function handleUpdateGPSDataFromLocal(request, env, start = 0, limit = 10) {
+  // Find activities with gps_polyline (regardless of gps_polylines table)
+  const query = `
+    SELECT id, gps_polyline
+    FROM activities
+    WHERE gps_polyline IS NOT NULL AND gps_polyline != ''
+    ORDER BY start_time ASC
+    LIMIT ? OFFSET ?
+  `;
+  const activities = (await env.DATABASE.prepare(query).bind(limit, start).all()).results;
+  let updated = 0;
+  let failed = 0;
+  console.log(`[GPS-BACKFILL] Processing batch: start=${start}, limit=${limit}, found=${activities.length}`);
+  for (const act of activities) {
+    try {
+      console.log(`[GPS-BACKFILL] Activity ${act.id}: Raw gps_polyline type:`, typeof act.gps_polyline);
+      let points = [];
+      if (typeof act.gps_polyline === 'string') {
+        try {
+          points = JSON.parse(act.gps_polyline);
+        } catch (err) {
+          console.error(`[GPS-BACKFILL] Activity ${act.id}: Failed to parse gps_polyline string`, act.gps_polyline, err);
+          failed++;
+          continue;
+        }
+      } else if (Array.isArray(act.gps_polyline)) {
+        points = act.gps_polyline;
+      } else {
+        console.warn(`[GPS-BACKFILL] Activity ${act.id}: gps_polyline is not a string or array`, act.gps_polyline);
+        failed++;
+        continue;
+      }
+      // Only use points with lat/lon
+      const coords = points.map(p => ({lat: p.lat, lng: p.lon})).filter(p => typeof p.lat === 'number' && typeof p.lng === 'number');
+      console.log(`[GPS-BACKFILL] Activity ${act.id}: Parsed ${coords.length} valid points`);
+      if (coords.length > 1) {
+        await storeEncodedPolyline(act.id, coords, env);
+        console.log(`[GPS-BACKFILL] Activity ${act.id}: Polyline stored/overwritten`);
+        updated++;
+      } else {
+        console.warn(`[GPS-BACKFILL] Activity ${act.id}: Not enough valid points for polyline`);
+        failed++;
+      }
+    } catch (e) {
+      console.error(`[GPS-BACKFILL] Activity ${act.id}: Failed to process`, e);
+      failed++;
+    }
+  }
+  console.log(`[GPS-BACKFILL] Batch complete: updated=${updated}, failed=${failed}, processed=${activities.length}`);
+  return new Response(JSON.stringify({
+    success: true,
+    updated,
+    failed,
+    processed: activities.length,
+    batch: { start, limit },
+    message: `Polylines overwritten from gps_polyline column: ${updated}/${activities.length}, failed: ${failed}`
+  }), {
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+  });
+}
 
   // Upload all activities endpoint (GPS and non-GPS)
   if (url.pathname === '/update-all-activities' && request.method === 'POST') {
@@ -354,7 +414,6 @@ async function handleGetStrengthActivities(request, env) {
 
 async function handleGetGPSActivities(request, env) {
   try {
-    await ensureTables(env);
     // Try to get cached data first
     let cached = await env.GARMIN_SYNC_KV.get('gps_activities_cache', { type: 'json' });
     if (cached) {
@@ -373,7 +432,7 @@ async function handleGetGPSActivities(request, env) {
     }
     // If not cached, generate and cache
     const data = await generateGPSActivities(env);
-    // await env.GARMIN_SYNC_KV.put('gps_activities_cache', JSON.stringify(data));
+    await env.GARMIN_SYNC_KV.put('gps_activities_cache', JSON.stringify(data));
     return new Response(JSON.stringify({
       success: true,
       activities: data.activities,
@@ -406,21 +465,14 @@ async function handleGetGPSActivities(request, env) {
  */
 // Generate all activities with GPS data, including encoded polylines
 async function generateGPSActivities(env) {
-  await ensureTables(env);
-  // Get all activities with distance > 0
   const activitiesQuery = `
-    SELECT id, type, duration, distance, start_time, name
-    FROM activities
-    WHERE distance IS NOT NULL AND distance > 0
-    ORDER BY start_time DESC
+    SELECT a.id, a.type, a.duration, a.distance, a.start_time, a.name, g.polyline AS encodedPolyline
+    FROM activities a
+    LEFT JOIN gps_polylines g ON a.id = g.activity_id
+    WHERE a.distance IS NOT NULL AND a.distance > 0
+    ORDER BY a.start_time DESC
   `;
   const activities = (await env.DATABASE.prepare(activitiesQuery).all()).results;
-  // For each activity, get encoded polyline if available
-  const polylineQuery = `SELECT polyline FROM gps_polylines WHERE activity_id = ?`;
-  for (const activity of activities) {
-    const polylineRow = await env.DATABASE.prepare(polylineQuery).bind(activity.id).first();
-    activity.encodedPolyline = polylineRow ? polylineRow.polyline : null;
-  }
   return {
     lastUpdated: new Date().toISOString(),
     activities
@@ -429,8 +481,25 @@ async function generateGPSActivities(env) {
 
 // Store encoded polyline for an activity
 async function storeEncodedPolyline(activityId, points, env) {
-  if (!Array.isArray(points) || points.length === 0) return;
-  const encoded = polyline.encode(points);
+  if (!Array.isArray(points) || points.length === 0) {
+    console.warn(`[POLYLINE] Activity ${activityId}: No points to encode.`);
+    return;
+  }
+  // Convert points to [lat, lng] pairs if needed
+  const coords = points.map(p => Array.isArray(p) ? p : [p.lat, p.lng]);
+  if (typeof polyline === 'undefined' || typeof polyline.encode !== 'function') {
+    console.error(`[POLYLINE] Activity ${activityId}: Polyline encoder is not available!`);
+    return;
+  }
+  console.log(`[POLYLINE] Activity ${activityId}: Input to encoder (first 5):`, JSON.stringify(coords.slice(0, 5)), `... total: ${coords.length}`);
+  let encoded;
+  try {
+    encoded = polyline.encode(coords);
+    console.log(`[POLYLINE] Activity ${activityId}: Encoded polyline (first 100 chars):`, encoded.slice(0, 100), `... length: ${encoded.length}`);
+  } catch (err) {
+    console.error(`[POLYLINE] Activity ${activityId}: Error encoding polyline`, err);
+    return;
+  }
   await ensureTables(env);
   const upsertSQL = `
     INSERT INTO gps_polylines (activity_id, polyline)
