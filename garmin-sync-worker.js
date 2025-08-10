@@ -32,7 +32,6 @@ export default {
 async function handleScheduled(event, env) {
   console.log('Running scheduled Garmin sync...');
   return await syncGarminData(env);
-}
 
 /**
  * Handle HTTP requests (webhook endpoint)
@@ -282,7 +281,7 @@ async function handleGetActivityStatsSummary(request, env) {
   }
 }
 
-async function handleGetStrengthActivities(request, env) {
+
 /**
  * Handle GET /recent-activities endpoint
  * Returns the 10 most recent activities
@@ -320,10 +319,60 @@ async function handleGetRecentActivities(request, env) {
   }
 }
 
+// ...existing code...
+
 /**
  * Handle GET /activity-stats endpoint
  * Returns stats for the past week, 2 weeks, 4 weeks, and year
  */
+async function handleGetGPSActivities(request, env) {
+  try {
+    // Try to get cached data first
+    let cached = await env.GARMIN_SYNC_KV.get('gps_activities_cache', { type: 'json' });
+    if (cached) {
+      return new Response(JSON.stringify({
+        success: true,
+        activities: cached.activities,
+        lastUpdated: cached.lastUpdated,
+        cached: true
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=3600'
+        }
+      });
+    }
+    // If not cached, generate and cache
+    const data = await generateGPSActivities(env);
+    await env.GARMIN_SYNC_KV.put('gps_activities_cache', JSON.stringify(data));
+    return new Response(JSON.stringify({
+      success: true,
+      activities: data.activities,
+      lastUpdated: data.lastUpdated,
+      cached: false
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting GPS activities:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
 async function handleGetActivityStatsSummary(request, env) {
   try {
     const now = new Date();
