@@ -38,6 +38,19 @@ async function handleScheduled(event, env) {
  * Handle HTTP requests (webhook endpoint)
  */
 async function handleRequest(request, env, ctx) {
+  // Endpoint: 10 most recent activities
+  if (url.pathname === '/recent-activities' && request.method === 'GET') {
+    return handleGetRecentActivities(request, env);
+  }
+
+  // Endpoint: stats for past week, 2 weeks, 4 weeks, year
+  if (url.pathname === '/activity-stats' && request.method === 'GET') {
+    return handleGetActivityStatsSummary(request, env);
+  }
+  // GPS activities endpoint with caching
+  if (url.pathname === '/gps-activities' && request.method === 'GET') {
+    return handleGetGPSActivities(request, env);
+  }
   const url = new URL(request.url);
   
   // Handle CORS preflight requests
@@ -176,6 +189,210 @@ async function handleRequest(request, env, ctx) {
   return new Response('Not Found', { status: 404 });
 }
 async function handleGetStrengthActivities(request, env) {
+/**
+ * Handle GET /recent-activities endpoint
+ * Returns the 10 most recent activities
+ */
+async function handleGetRecentActivities(request, env) {
+  try {
+    const activitiesQuery = `
+      SELECT * FROM activities
+      ORDER BY start_time DESC
+      LIMIT 10
+    `;
+    const activities = (await env.DATABASE.prepare(activitiesQuery).all()).results;
+    return new Response(JSON.stringify({
+      success: true,
+      activities
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=600'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting recent activities:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Handle GET /activity-stats endpoint
+ * Returns stats for the past week, 2 weeks, 4 weeks, and year
+ */
+async function handleGetActivityStatsSummary(request, env) {
+  try {
+    const now = new Date();
+    // Helper to get ISO string for N days ago
+    const daysAgo = (n) => {
+      const d = new Date(now);
+      d.setDate(d.getDate() - n);
+      return d.toISOString();
+    };
+    // Helper to get ISO string for N years ago
+    const yearsAgo = (n) => {
+      const d = new Date(now);
+      d.setFullYear(d.getFullYear() - n);
+      return d.toISOString();
+    };
+
+    // Time windows
+    const windows = [
+      { label: 'week', since: daysAgo(7) },
+      { label: 'two_weeks', since: daysAgo(14) },
+      { label: 'four_weeks', since: daysAgo(28) },
+      { label: 'year', since: yearsAgo(1) }
+    ];
+
+    // For each window, get stats
+    const stats = {};
+    for (const win of windows) {
+      // Activities in window
+      const activitiesQuery = `
+        SELECT id, type, duration, distance, total_sets, total_reps
+        FROM activities
+        WHERE start_time >= ?
+      `;
+      const activities = (await env.DATABASE.prepare(activitiesQuery).bind(win.since).all()).results;
+
+      // Aggregate stats
+      let activityCount = activities.length;
+      let totalTime = 0;
+      let totalDistance = 0;
+      let totalSets = 0;
+      let totalReps = 0;
+      let totalVolume = 0;
+
+      for (const act of activities) {
+        totalTime += act.duration || 0;
+        totalDistance += act.distance || 0;
+        totalSets += act.total_sets || 0;
+        totalReps += act.total_reps || 0;
+        // For volume, sum from exercise_sets table if strength
+        if (act.type === 'strength_training' || act.type === 'strength') {
+          const setsQuery = `SELECT SUM(total_volume) as volume FROM exercise_sets WHERE activity_id = ?`;
+          const res = await env.DATABASE.prepare(setsQuery).bind(act.id).first();
+          totalVolume += res?.volume || 0;
+        }
+      }
+
+      stats[win.label] = {
+        activityCount,
+        totalTime,
+        totalDistance,
+        totalSets,
+        totalReps,
+        totalVolume
+      };
+    }
+
+    return new Response(JSON.stringify({
+      success: true,
+      stats
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=600'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting activity stats summary:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+/**
+ * Handle GET /gps-activities endpoint
+ * Returns all activities with GPS data (distance > 0), including their GPS points if available
+ * Caches the result for efficiency
+ */
+async function handleGetGPSActivities(request, env) {
+  try {
+    // Try to get cached data first
+    let cached = await env.GARMIN_SYNC_KV.get('gps_activities_cache', { type: 'json' });
+    if (cached) {
+      return new Response(JSON.stringify({
+        success: true,
+        activities: cached.activities,
+        lastUpdated: cached.lastUpdated,
+        cached: true
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'public, max-age=3600'
+        }
+      });
+    }
+    // If not cached, generate and cache
+    const data = await generateGPSActivities(env);
+    await env.GARMIN_SYNC_KV.put('gps_activities_cache', JSON.stringify(data));
+    return new Response(JSON.stringify({
+      success: true,
+      activities: data.activities,
+      lastUpdated: data.lastUpdated,
+      cached: false
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting GPS activities:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Generate all activities with GPS data (distance > 0)
+ * Includes their GPS points if available
+ */
+async function generateGPSActivities(env) {
+  // Get all activities with distance > 0
+  const activitiesQuery = `
+    SELECT * FROM activities
+    WHERE distance IS NOT NULL AND distance > 0
+    ORDER BY start_time DESC
+  `;
+  const activities = (await env.DATABASE.prepare(activitiesQuery).all()).results;
+  // For each activity, try to get GPS data if available (if stored in a gpsData/gps_points column, or skip if not present)
+  // If you store GPS points in a separate table, you can join here. For now, just return the activity as-is.
+  // If you want to include GPS points, add logic here to fetch them per activity.
+  return {
+    lastUpdated: new Date().toISOString(),
+    activities
+  };
+}
   try {
     // Try to get cached data first
     let cached = await env.GARMIN_SYNC_KV.get('strength_activities_cache', { type: 'json' });
