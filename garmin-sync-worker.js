@@ -47,7 +47,7 @@ async function handleRequest(request, env, ctx) {
 
   // Endpoint: stats for past week, 2 weeks, 4 weeks, year
   if (url.pathname === '/activity-stats' && request.method === 'GET') {
-    return handleGetActivityStatsSummary(request, env);
+    return await handleGetActivityStatsSummary(request, env);
   }
 
   // GPS activities endpoint with caching
@@ -190,6 +190,98 @@ async function handleRequest(request, env, ctx) {
   
   return new Response('Not Found', { status: 404 });
 }
+// Move function definitions above their first use to avoid ReferenceError
+async function handleGetActivityStatsSummary(request, env) {
+  try {
+    const now = new Date();
+    // Helper to get ISO string for N days ago
+    const daysAgo = (n) => {
+      const d = new Date(now);
+      d.setDate(d.getDate() - n);
+      return d.toISOString();
+    };
+    // Helper to get ISO string for N years ago
+    const yearsAgo = (n) => {
+      const d = new Date(now);
+      d.setFullYear(d.getFullYear() - n);
+      return d.toISOString();
+    };
+
+    // Time windows
+    const windows = [
+      { label: 'week', since: daysAgo(7) },
+      { label: 'two_weeks', since: daysAgo(14) },
+      { label: 'four_weeks', since: daysAgo(28) },
+      { label: 'year', since: yearsAgo(1) }
+    ];
+
+    // For each window, get stats
+    const stats = {};
+    for (const win of windows) {
+      // Activities in window
+      const activitiesQuery = `
+        SELECT id, type, duration, distance, total_sets, total_reps
+        FROM activities
+        WHERE start_time >= ?
+      `;
+      const activities = (await env.DATABASE.prepare(activitiesQuery).bind(win.since).all()).results;
+
+      // Aggregate stats
+      let activityCount = activities.length;
+      let totalTime = 0;
+      let totalDistance = 0;
+      let totalSets = 0;
+      let totalReps = 0;
+      let totalVolume = 0;
+
+      for (const act of activities) {
+        totalTime += act.duration || 0;
+        totalDistance += act.distance || 0;
+        totalSets += act.total_sets || 0;
+        totalReps += act.total_reps || 0;
+        // For volume, sum from exercise_sets table if strength
+        if (act.type === 'strength_training' || act.type === 'strength') {
+          const setsQuery = `SELECT SUM(total_volume) as volume FROM exercise_sets WHERE activity_id = ?`;
+          const res = await env.DATABASE.prepare(setsQuery).bind(act.id).first();
+          totalVolume += res?.volume || 0;
+        }
+      }
+
+      stats[win.label] = {
+        activityCount,
+        totalTime,
+        totalDistance,
+        totalSets,
+        totalReps,
+        totalVolume
+      };
+    }
+
+    return new Response(JSON.stringify({
+      success: true,
+      stats
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=600'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting activity stats summary:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
 async function handleGetStrengthActivities(request, env) {
 /**
  * Handle GET /recent-activities endpoint
