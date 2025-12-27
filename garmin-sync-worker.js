@@ -28,7 +28,7 @@ export default {
   }
 };
 
-// --- DATABASE MIGRATION: Create gps_polylines table if not exists ---
+// --- DATABASE MIGRATION: Create tables if not exist ---
 async function ensureGPSPolylinesTable(env) {
   const createTableSQL = `
     CREATE TABLE IF NOT EXISTS gps_polylines (
@@ -39,11 +39,29 @@ async function ensureGPSPolylinesTable(env) {
   await env.DATABASE.exec(createTableSQL);
 }
 
+async function ensureLifestyleLoggingTable(env) {
+  const createTableSQL = `
+    CREATE TABLE IF NOT EXISTS lifestyle_logging (
+      date TEXT PRIMARY KEY,
+      data TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `;
+  await env.DATABASE.exec(createTableSQL);
+  console.log('✅ Lifestyle logging table ensured');
+}
+
 // Call this at startup (first request)
 let gpsPolylinesTableChecked = true;
+let lifestyleLoggingTableChecked = false;
 async function ensureTables(env) {
   if (!gpsPolylinesTableChecked) {
     gpsPolylinesTableChecked = true;
+  }
+  if (!lifestyleLoggingTableChecked) {
+    await ensureLifestyleLoggingTable(env);
+    lifestyleLoggingTableChecked = true;
   }
 }
 
@@ -265,6 +283,21 @@ async function handleUpdateGPSDataFromLocal(request, env, start = 0, limit = 10)
       }
     });
   }
+
+  // Lifestyle logging endpoint
+  if (url.pathname === '/lifestyle-logging' && request.method === 'GET') {
+    return handleGetLifestyleLogging(request, env);
+  }
+
+  // Lifestyle logging data endpoint - serve all records
+  if (url.pathname === '/lifestyle-data' && request.method === 'GET') {
+    return handleGetAllLifestyleData(request, env);
+  }
+
+  // Sync lifestyle logging data endpoint
+  if (url.pathname === '/sync-lifestyle' && request.method === 'POST') {
+    return handleSyncLifestyleLogging(request, env);
+  }
   
   return new Response('Not Found', { status: 404 });
 }
@@ -459,6 +492,240 @@ async function handleGetGPSActivities(request, env) {
     });
   }
 }
+
+/**
+ * Handle lifestyle logging data request
+ */
+async function handleGetLifestyleLogging(request, env) {
+  try {
+    const url = new URL(request.url);
+    const date = url.searchParams.get('date') || new Date().toISOString().split('T')[0];
+    
+    // Validate date format (YYYY-MM-DD)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Invalid date format. Use YYYY-MM-DD'
+      }), {
+        status: 400,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // Ensure tables exist
+    await ensureTables(env);
+
+    // Authenticate with Garmin
+    const authData = await authenticateGarmin(env);
+    if (!authData) {
+      throw new Error('Failed to authenticate with Garmin');
+    }
+
+    // Fetch lifestyle logging data
+    const lifestyleData = await fetchLifestyleLoggingData(date, authData);
+
+    // Store in database
+    if (lifestyleData) {
+      await storeLifestyleLoggingData(date, lifestyleData, env);
+    }
+
+    return new Response(JSON.stringify({
+      success: true,
+      date: date,
+      data: lifestyleData,
+      stored: !!lifestyleData,
+      timestamp: new Date().toISOString()
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting lifestyle logging data:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Handle get all lifestyle data request
+ */
+async function handleGetAllLifestyleData(request, env) {
+  try {
+    await ensureTables(env);
+    
+    const url = new URL(request.url);
+    const startDate = url.searchParams.get('start');
+    const endDate = url.searchParams.get('end');
+    const limit = parseInt(url.searchParams.get('limit') || '1000', 10);
+    
+    let query = 'SELECT date, data, created_at, updated_at FROM lifestyle_logging';
+    const params = [];
+    const conditions = [];
+    
+    if (startDate) {
+      conditions.push('date >= ?');
+      params.push(startDate);
+    }
+    
+    if (endDate) {
+      conditions.push('date <= ?');
+      params.push(endDate);
+    }
+    
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    query += ' ORDER BY date DESC LIMIT ?';
+    params.push(limit);
+    
+    const stmt = env.DATABASE.prepare(query);
+    const results = (await stmt.bind(...params).all()).results;
+    
+    // Parse the JSON data for each record
+    const records = results.map(row => ({
+      date: row.date,
+      data: JSON.parse(row.data),
+      created_at: row.created_at,
+      updated_at: row.updated_at
+    }));
+    
+    return new Response(JSON.stringify({
+      success: true,
+      count: records.length,
+      records: records,
+      filters: {
+        startDate: startDate || null,
+        endDate: endDate || null,
+        limit: limit
+      },
+      timestamp: new Date().toISOString()
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=300'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting all lifestyle data:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Handle sync lifestyle logging data - fetch and store for a date range
+ */
+async function handleSyncLifestyleLogging(request, env) {
+  try {
+    await ensureTables(env);
+    
+    const url = new URL(request.url);
+    const startDate = url.searchParams.get('start');
+    const endDate = url.searchParams.get('end') || new Date().toISOString().split('T')[0];
+    const daysBack = parseInt(url.searchParams.get('days') || '30', 10);
+    
+    // Calculate start date if not provided
+    let start = startDate;
+    if (!start) {
+      const d = new Date();
+      d.setDate(d.getDate() - daysBack);
+      start = d.toISOString().split('T')[0];
+    }
+    
+    // Authenticate with Garmin
+    const authData = await authenticateGarmin(env);
+    if (!authData) {
+      throw new Error('Failed to authenticate with Garmin');
+    }
+    
+    // Generate array of dates to sync
+    const dates = [];
+    const currentDate = new Date(start);
+    const end = new Date(endDate);
+    
+    while (currentDate <= end) {
+      dates.push(currentDate.toISOString().split('T')[0]);
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+    
+    console.log(`🔄 Syncing lifestyle logging data for ${dates.length} days (${start} to ${endDate})`);
+    
+    let synced = 0;
+    let failed = 0;
+    
+    for (const date of dates) {
+      try {
+        const lifestyleData = await fetchLifestyleLoggingData(date, authData);
+        if (lifestyleData) {
+          await storeLifestyleLoggingData(date, lifestyleData, env);
+          synced++;
+          console.log(`✅ Synced lifestyle data for ${date}`);
+        } else {
+          console.log(`⚠️ No lifestyle data for ${date}`);
+        }
+        // Rate limiting
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (error) {
+        console.error(`❌ Failed to sync lifestyle data for ${date}:`, error);
+        failed++;
+      }
+    }
+    
+    return new Response(JSON.stringify({
+      success: true,
+      synced: synced,
+      failed: failed,
+      total: dates.length,
+      dateRange: {
+        start: start,
+        end: endDate
+      },
+      timestamp: new Date().toISOString()
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error syncing lifestyle logging data:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
 /**
  * Generate all activities with GPS data (distance > 0)
  * Includes their GPS points if available
@@ -856,6 +1123,9 @@ async function syncGarminData(env) {
       // Process and store activities with subrequest limit awareness
       const processedCount = await processAndStoreActivitiesWithLimits(activities, authData, env);
       
+      // Sync today's lifestyle logging data
+      await syncTodayLifestyleLogging(authData, env);
+      
       await refreshActivityStats(env);
       await refreshStrengthActivitiesCache(env);
       
@@ -877,6 +1147,24 @@ async function syncGarminData(env) {
       error: error.message,
       timestamp: new Date().toISOString()
     };
+  }
+}
+
+/**
+ * Sync today's lifestyle logging data
+ */
+async function syncTodayLifestyleLogging(authData, env) {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    console.log(`📊 Syncing lifestyle logging data for ${today}`);
+    
+    const lifestyleData = await fetchLifestyleLoggingData(today, authData);
+    if (lifestyleData) {
+      await storeLifestyleLoggingData(today, lifestyleData, env);
+      console.log(`✅ Synced lifestyle data for ${today}`);
+    }
+  } catch (error) {
+    console.error(`❌ Failed to sync lifestyle data:`, error);
   }
 }
 
@@ -1669,6 +1957,68 @@ async function fetchActivityWeatherData(activityId, authData) {
   } catch (error) {
     console.error(`Error fetching weather data for ${activityId}:`, error);
     return { hasWeatherData: false };
+  }
+}
+
+/**
+ * Fetch lifestyle logging data for a specific date
+ */
+async function fetchLifestyleLoggingData(date, authData) {
+  try {
+    const url = `${GARMIN_BASE_URL}/lifestylelogging-service/dailyLog/${date}`;
+    
+    const headers = {
+      'Accept': 'application/json',
+      'User-Agent': 'com.garmin.android.apps.connectmobile',
+      'Authorization': `Bearer ${authData.bearerToken}`
+    };
+
+    console.log(`Fetching lifestyle logging data for ${date}`);
+    const response = await fetch(url, { headers });
+    
+    if (!response.ok) {
+      console.warn(`Failed to fetch lifestyle logging data for ${date}: ${response.status}`);
+      return null;
+    }
+    
+    const data = await response.json();
+    console.log(`Successfully fetched lifestyle logging data for ${date}`);
+    
+    return data;
+    
+  } catch (error) {
+    console.error(`Error fetching lifestyle logging data for ${date}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Store lifestyle logging data in the database
+ */
+async function storeLifestyleLoggingData(date, data, env) {
+  try {
+    await ensureTables(env);
+    
+    const now = new Date().toISOString();
+    const dataJson = JSON.stringify(data);
+    
+    const upsertSQL = `
+      INSERT INTO lifestyle_logging (date, data, created_at, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(date) DO UPDATE SET 
+        data = excluded.data,
+        updated_at = excluded.updated_at
+    `;
+    
+    await env.DATABASE.prepare(upsertSQL)
+      .bind(date, dataJson, now, now)
+      .run();
+    
+    console.log(`✅ Stored lifestyle logging data for ${date}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to store lifestyle logging data for ${date}:`, error);
+    return false;
   }
 }
 
