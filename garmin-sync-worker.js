@@ -36,7 +36,8 @@ async function ensureGPSPolylinesTable(env) {
       polyline TEXT NOT NULL
     );
   `;
-  await env.DATABASE.exec(createTableSQL);
+  // Use prepare().run() instead of exec() to avoid D1 internal metadata errors
+  await env.DATABASE.prepare(createTableSQL).run();
 }
 
 async function ensureLifestyleLoggingTable(env) {
@@ -48,7 +49,8 @@ async function ensureLifestyleLoggingTable(env) {
       updated_at TEXT NOT NULL
     );
   `;
-  await env.DATABASE.exec(createTableSQL);
+  // Use prepare().run() instead of exec() to avoid D1 internal metadata errors
+  await env.DATABASE.prepare(createTableSQL).run();
   console.log('✅ Lifestyle logging table ensured');
 }
 
@@ -294,6 +296,16 @@ async function handleUpdateGPSDataFromLocal(request, env, start = 0, limit = 10)
     return handleGetAllLifestyleData(request, env);
   }
 
+  // Lifestyle logging CSV export endpoint
+  if (url.pathname === '/lifestyle-data.csv' && request.method === 'GET') {
+    return handleGetLifestyleDataCSV(request, env);
+  }
+
+  // Workout statistics CSV export endpoint
+  if (url.pathname === '/workout-stats.csv' && request.method === 'GET') {
+    return handleGetWorkoutStatsCSV(request, env);
+  }
+
   // Sync lifestyle logging data endpoint
   if (url.pathname === '/sync-lifestyle' && request.method === 'POST') {
     return handleSyncLifestyleLogging(request, env);
@@ -496,7 +508,7 @@ async function handleGetGPSActivities(request, env) {
 /**
  * Handle lifestyle logging data request
  */
-async function handleGetLifestyleLogging(request, env) {
+async function  handleGetLifestyleLogging(request, env) {
   try {
     const url = new URL(request.url);
     const date = url.searchParams.get('date') || new Date().toISOString().split('T')[0];
@@ -713,6 +725,233 @@ async function handleSyncLifestyleLogging(request, env) {
     });
   } catch (error) {
     console.error('❌ Error syncing lifestyle logging data:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Handle get lifestyle data as CSV
+ */
+async function handleGetLifestyleDataCSV(request, env) {
+  try {
+    await ensureTables(env);
+    
+    const url = new URL(request.url);
+    const startDate = url.searchParams.get('start');
+    const endDate = url.searchParams.get('end');
+    const limit = parseInt(url.searchParams.get('limit') || '10000', 10);
+    
+    let query = 'SELECT date, data, created_at, updated_at FROM lifestyle_logging';
+    const params = [];
+    const conditions = [];
+    
+    if (startDate) {
+      conditions.push('date >= ?');
+      params.push(startDate);
+    }
+    
+    if (endDate) {
+      conditions.push('date <= ?');
+      params.push(endDate);
+    }
+    
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    query += ' ORDER BY date ASC LIMIT ?';
+    params.push(limit);
+    
+    const stmt = env.DATABASE.prepare(query);
+    const results = (await stmt.bind(...params).all()).results;
+    
+    // First pass: collect all unique behavior names
+    const allBehaviors = new Set();
+    const dataByDate = new Map();
+    
+    for (const row of results) {
+      const date = row.date;
+      const data = JSON.parse(row.data);
+      const behaviorData = {};
+      
+      if (data.dailyLogsReport && Array.isArray(data.dailyLogsReport)) {
+        for (const log of data.dailyLogsReport) {
+          const behaviorName = log.name;
+          allBehaviors.add(behaviorName);
+          
+          // Store the value for this behavior
+          if (log.logStatus === 'YES') {
+            if (log.measurementType === 'QUANTITY' && log.details && log.details[0]) {
+              behaviorData[behaviorName] = log.details[0].amount;
+            } else {
+              behaviorData[behaviorName] = 'YES';
+            }
+          } else {
+            behaviorData[behaviorName] = 'NO';
+          }
+        }
+      }
+      
+      dataByDate.set(date, behaviorData);
+    }
+    
+    // Sort behaviors alphabetically for consistent column order
+    const sortedBehaviors = Array.from(allBehaviors).sort();
+    
+    // Build CSV
+    const csvRows = [];
+    
+    // Header row
+    csvRows.push(['Date', ...sortedBehaviors.map(b => `"${b.replace(/"/g, '""')}"`)].join(','));
+    
+    // Data rows
+    for (const [date, behaviorData] of dataByDate) {
+      const row = [date];
+      
+      for (const behavior of sortedBehaviors) {
+        row.push(behaviorData[behavior] || '');
+      }
+      
+      csvRows.push(row.join(','));
+    }
+    
+    const csv = csvRows.join('\n');
+    
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="lifestyle-data-${new Date().toISOString().split('T')[0]}.csv"`,
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error generating lifestyle data CSV:', error);
+    return new Response(JSON.stringify({
+      success: false,
+      error: error.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+/**
+ * Handle get workout statistics as CSV
+ */
+async function handleGetWorkoutStatsCSV(request, env) {
+  try {
+    const url = new URL(request.url);
+    const startDate = url.searchParams.get('start');
+    const endDate = url.searchParams.get('end');
+    
+    // Query to get daily workout statistics
+    let query = `
+      SELECT 
+        DATE(start_time) as workout_date,
+        SUM(CASE WHEN type = 'strength_training' THEN duration ELSE 0 END) as gym_time_seconds,
+        SUM(CASE WHEN type = 'strength_training' THEN total_sets ELSE 0 END) as gym_sets,
+        SUM(duration) as total_exercise_time_seconds,
+        SUM(CASE WHEN type = 'strength_training' THEN total_working_time ELSE 0 END) as gym_working_time_seconds
+      FROM activities
+    `;
+    
+    const params = [];
+    const conditions = [];
+    
+    if (startDate) {
+      conditions.push('DATE(start_time) >= ?');
+      params.push(startDate);
+    }
+    
+    if (endDate) {
+      conditions.push('DATE(start_time) <= ?');
+      params.push(endDate);
+    }
+    
+    if (conditions.length > 0) {
+      query += ' WHERE ' + conditions.join(' AND ');
+    }
+    
+    query += ' GROUP BY DATE(start_time) ORDER BY workout_date ASC';
+    
+    const stmt = env.DATABASE.prepare(query);
+    const dailyStats = (await stmt.bind(...params).all()).results;
+    
+    // Get average weight per rep (need to calculate from exercise_sets table)
+    const weightQuery = `
+      SELECT 
+        DATE(a.start_time) as workout_date,
+        AVG(e.weight) as avg_weight_per_rep,
+        COUNT(e.id) as total_sets
+      FROM activities a
+      LEFT JOIN exercise_sets e ON a.id = e.activity_id
+      WHERE e.weight IS NOT NULL AND e.weight > 0
+    `;
+    
+    let weightQueryFull = weightQuery;
+    const weightConditions = [...conditions];
+    if (weightConditions.length > 0) {
+      weightQueryFull += ' AND ' + weightConditions.join(' AND ');
+    }
+    weightQueryFull += ' GROUP BY DATE(a.start_time)';
+    
+    const weightStmt = env.DATABASE.prepare(weightQueryFull);
+    const weightResults = (await weightStmt.bind(...params).all()).results;
+    
+    // Create a map for average weight lookup
+    const weightByDate = new Map();
+    for (const row of weightResults) {
+      weightByDate.set(row.workout_date, row.avg_weight_per_rep || 0);
+    }
+    
+    // Build CSV
+    const csvRows = [];
+    
+    // Header row
+    csvRows.push('Date,Gym Time (minutes),Gym Sets,Total Exercise Time (minutes),Avg Weight Per Rep (lbs)');
+    
+    // Data rows
+    for (const row of dailyStats) {
+      const date = row.workout_date;
+      const gymTimeMinutes = Math.round(row.gym_time_seconds / 60);
+      const totalTimeMinutes = Math.round(row.total_exercise_time_seconds / 60);
+      const avgWeight = Math.round((weightByDate.get(date) || 0) * 10) / 10; // Round to 1 decimal
+      
+      csvRows.push([
+        date,
+        gymTimeMinutes,
+        row.gym_sets || 0,
+        totalTimeMinutes,
+        avgWeight
+      ].join(','));
+    }
+    
+    const csv = csvRows.join('\n');
+    
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="workout-stats-${new Date().toISOString().split('T')[0]}.csv"`,
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error generating workout stats CSV:', error);
     return new Response(JSON.stringify({
       success: false,
       error: error.message
@@ -1155,13 +1394,33 @@ async function syncGarminData(env) {
  */
 async function syncTodayLifestyleLogging(authData, env) {
   try {
-    const today = new Date().toISOString().split('T')[0];
-    console.log(`📊 Syncing lifestyle logging data for ${today}`);
+    // Sync the last 3 days to ensure we have complete data
+    const dates = [];
     
-    const lifestyleData = await fetchLifestyleLoggingData(today, authData);
-    if (lifestyleData) {
-      await storeLifestyleLoggingData(today, lifestyleData, env);
-      console.log(`✅ Synced lifestyle data for ${today}`);
+    // Day before yesterday
+    const dayBeforeYesterday = new Date();
+    dayBeforeYesterday.setDate(dayBeforeYesterday.getDate() - 2);
+    dates.push(dayBeforeYesterday.toISOString().split('T')[0]);
+    
+    // Yesterday
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    dates.push(yesterday.toISOString().split('T')[0]);
+    
+    // Today
+    const today = new Date().toISOString().split('T')[0];
+    dates.push(today);
+    
+    console.log(`📊 Syncing lifestyle logging data for ${dates.join(', ')}`);
+    
+    for (const date of dates) {
+      const data = await fetchLifestyleLoggingData(date, authData);
+      if (data) {
+        await storeLifestyleLoggingData(date, data, env);
+        console.log(`✅ Synced lifestyle data for ${date}`);
+      }
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
   } catch (error) {
     console.error(`❌ Failed to sync lifestyle data:`, error);
@@ -1597,6 +1856,10 @@ async function fetchActivities(authData, lastSyncTime, isInitialSync) {
     let filteredActivities = activities;
     if (lastSyncTime && !isInitialSync) {
       filteredActivities = activities.filter(activity => {
+        // Skip undefined/null activities
+        if (!activity || !activity.startTimeLocal) {
+          return false;
+        }
         const activityDate = new Date(activity.startTimeLocal);
         return activityDate > new Date(lastSyncTime);
       });
@@ -1684,6 +1947,12 @@ async function processAndStoreActivities(activities, authData, env) {
   
   for (const activity of activities) {
     try {
+      // Skip undefined/null activities
+      if (!activity || !activity.activityId) {
+        console.warn('⚠️ Skipping undefined or invalid activity');
+        continue;
+      }
+      
       // Check if activity already exists
       const existing = await getActivityById(activity.activityId, env);
       if (existing && !shouldUpdateActivity(existing, activity)) {
@@ -1740,6 +2009,12 @@ async function processAndStoreActivitiesWithLimits(activities, authData, env, ma
   
   for (const activity of activities) {
     try {
+      // Skip undefined/null activities
+      if (!activity || !activity.activityId) {
+        console.warn('⚠️ Skipping undefined or invalid activity');
+        continue;
+      }
+      
       // Estimate subrequests needed for this activity
       let estimatedSubrequests = 0;
       
@@ -1997,10 +2272,14 @@ async function fetchLifestyleLoggingData(date, authData) {
  */
 async function storeLifestyleLoggingData(date, data, env) {
   try {
+    console.log(`📝 Storing lifestyle logging data for ${date}`);
     await ensureTables(env);
+    console.log(`✅ Tables ensured for ${date}`);
     
     const now = new Date().toISOString();
+    console.log(`📝 Stringifying data for ${date}...`);
     const dataJson = JSON.stringify(data);
+    console.log(`✅ Data stringified for ${date}, length: ${dataJson.length}`);
     
     const upsertSQL = `
       INSERT INTO lifestyle_logging (date, data, created_at, updated_at)
@@ -2010,6 +2289,7 @@ async function storeLifestyleLoggingData(date, data, env) {
         updated_at = excluded.updated_at
     `;
     
+    console.log(`📝 Executing database upsert for ${date}...`);
     await env.DATABASE.prepare(upsertSQL)
       .bind(date, dataJson, now, now)
       .run();
@@ -2018,6 +2298,7 @@ async function storeLifestyleLoggingData(date, data, env) {
     return true;
   } catch (error) {
     console.error(`❌ Failed to store lifestyle logging data for ${date}:`, error);
+    console.error(`❌ Error stack:`, error.stack);
     return false;
   }
 }
@@ -2026,6 +2307,12 @@ async function storeLifestyleLoggingData(date, data, env) {
  * Process activity data based on type
  */
 function processActivityData(activity) {
+  // Handle undefined or null activity
+  if (!activity) {
+    console.error('❌ processActivityData called with undefined/null activity');
+    throw new Error('Activity data is required');
+  }
+  
   const baseActivity = {
     id: activity.activityId,
     name: activity.activityName,
